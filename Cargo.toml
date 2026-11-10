@@ -6,6 +6,9 @@ edition = "2021"
 resolver = "2"
 rust-version = "1.82"
 
+[workspace]
+members = [".", "crates/power", "crates/sms"]
+
 [[bin]]
 name = "esprs"
 harness = false # do not use the built-in cargo test harness -> resolve rust-analyzer errors
@@ -23,10 +26,17 @@ esp-idf-svc = { git = "https://github.com/esp-rs/esp-idf-svc.git" }
 
 [dependencies]
 log = "0.4"
-esp-idf-svc = { version = "0.53", features = ["critical-section", "embassy-time-driver", "embassy-sync"] }
+esp-idf-svc = { version = "0.53", features = [
+    "critical-section",
+    "embassy-time-driver",
+    "embassy-sync",
+] }
 # Remove `generic-queue-8` if you plan to use `embassy-time` WITH `embassy-executor`
 embassy-time = { version = "0.5", features = ["generic-queue-8"] }
 anyhow = "1.0.104"
+power = { path = "crates/power" }
+sms = { path = "crates/sms" }
+base64 = "0.23.1"
 
 [build-dependencies]
 embuild = "0.33.5"
