@@ -304,6 +304,9 @@ fn gsm7_lookup(c: u8) -> &'static str {
 }
 
 #[cfg(test)]
+mod test_vectors;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

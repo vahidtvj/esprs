@@ -1,0 +1,8 @@
+# This config allows running `cargo test -p sms` on the host (x86_64-unknown-linux-gnu)
+# by overriding the workspace default target (xtensa-esp32-espidf)
+
+[build]
+# Don't force a target - let cargo use the host target by default
+
+[target.x86_64-unknown-linux-gnu]
+# Host target runs natively, no special linker/runner needed
