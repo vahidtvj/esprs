@@ -100,7 +100,7 @@ mod tests {
             (TZ_NEGATIVE, "TZ_NEGATIVE"),
         ];
         for (case, name) in cases {
-            let (pdu, expected_sender, expected_message, _expected_date) = case;
+            let (pdu, expected_sender, expected_message, expected_date) = case;
             let result = parse_pdu(pdu);
             let sms = result.unwrap_or_else(|e| panic!("Failed to parse {}: {}", name, e));
             assert_eq!(sms.sender, expected_sender, "Sender mismatch for {}", name);
@@ -109,19 +109,52 @@ mod tests {
                 "Message mismatch for {}",
                 name
             );
+            assert_eq!(sms.date, expected_date, "Date mismatch for {}", name);
         }
     }
 
     #[test]
-    fn test_gsm7_empty_fails() {
+    fn test_gsm7_empty() {
         use crate::test_vectors::ok_cases::GSM7_EMPTY;
-        let (pdu, expected_sender, expected_message, _expected_date) = GSM7_EMPTY;
+        let (pdu, expected_sender, expected_message, expected_date) = GSM7_EMPTY;
         let result = parse_pdu(pdu);
-        // GSM7_EMPTY may fail or succeed, but we don't require it to pass
-        if let Ok(sms) = result {
-            assert_eq!(sms.sender, expected_sender);
-            assert_eq!(sms.message, expected_message);
-        }
+        let sms = result.unwrap_or_else(|e| panic!("Failed to parse GSM7_EMPTY: {}", e));
+        assert_eq!(sms.sender, expected_sender);
+        assert_eq!(sms.message, expected_message);
+        assert_eq!(sms.date, expected_date);
+    }
+
+    #[test]
+    fn test_dcs_compressed() {
+        // DCS 0x20 = compressed GSM-7 (general group, bit 5 set, alphabet 00)
+        // Build a minimal PDU with DCS=0x20
+        // SMSC: 07 91 89 39 05 00 41 00
+        // First octet: 04 (SMS-DELIVER)
+        // Sender len: 0C, type: 91, address: 89 29 10 32 54 76
+        // PID: 00, DCS: 20 (compressed)
+        // Timestamp: 62 11 01 71 91 85 40
+        // UDL: 02, User data: C8 34 (dummy)
+        let pdu = "0791893905004100040C9189291032547600206211017191854002C834";
+        let result = parse_pdu(pdu);
+        assert!(result.is_err(), "Compressed DCS should return Err");
+    }
+
+    #[test]
+    fn test_dcs_8bit() {
+        // DCS 0x04 = 8-bit data (general group, alphabet 01)
+        // Build a PDU with DCS=0x04 and 8-bit user data
+        // SMSC: 07 91 89 39 05 00 41 00
+        // First octet: 04 (SMS-DELIVER)
+        // Sender len: 0C, type: 91, address: 89 29 10 32 54 76
+        // PID: 00, DCS: 04 (8-bit data)
+        // Timestamp: 62 11 01 71 91 85 40
+        // UDL: 05 (5 bytes), User data: 48 65 6C 6C 6F ("Hello" in ASCII/UTF-8)
+        let pdu = "0791893905004100040C918929103254760004621101719185400548656C6C6F";
+        let result = parse_pdu(pdu);
+        let sms = result.unwrap_or_else(|e| panic!("Failed to parse 8-bit DCS: {}", e));
+        assert_eq!(sms.sender, "+989201234567");
+        assert_eq!(sms.message, "Hello");
+        assert_eq!(sms.date, "2026/11/10 17:19:58 +01:00");
     }
 
     #[test]

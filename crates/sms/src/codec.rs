@@ -7,6 +7,11 @@ pub fn decode_ucs2(bytes: &[u8]) -> String {
 }
 
 pub fn decode_gsm7(bytes: &[u8], padding_bits: u8, septet_count: usize) -> String {
+    // Handle UDL = 0 (empty message)
+    if septet_count == 0 {
+        return String::new();
+    }
+
     let mut message = String::new();
     let mut temp = 0u8;
     let mut j = (7 - padding_bits) % 7;

@@ -74,7 +74,11 @@ pub fn parse_pdu(pdu_hex: &str) -> Result<Sms> {
 
     let user_data = &bytes[pos..];
 
-    let is_ucs2 = (dcs & 0x0C) == 0x08;
+    // Determine encoding from DCS
+    let (is_ucs2, is_8bit, is_compressed) = decode_dcs(dcs);
+    if is_compressed {
+        anyhow::bail!("Compressed DCS not supported");
+    }
 
     // Validate user data length
     if is_ucs2 {
@@ -84,6 +88,11 @@ pub fn parse_pdu(pdu_hex: &str) -> Result<Sms> {
         }
         if user_data.len() < udl {
             anyhow::bail!("UCS2 user data truncated");
+        }
+    } else if is_8bit {
+        // 8-bit data: udl is number of bytes
+        if user_data.len() < udl {
+            anyhow::bail!("8-bit user data truncated");
         }
     } else {
         // GSM7: udl is number of septets
@@ -107,6 +116,9 @@ pub fn parse_pdu(pdu_hex: &str) -> Result<Sms> {
         let message_data = &user_data[1 + udhl..];
         if is_ucs2 {
             decode_ucs2(message_data)
+        } else if is_8bit {
+            // 8-bit data with UDH: decode remaining bytes as lossy UTF-8
+            String::from_utf8_lossy(message_data).into_owned()
         } else {
             // For GSM7 with UDH, the UDL includes UDH septets.
             // We need to recalculate septet count for message only.
@@ -116,6 +128,10 @@ pub fn parse_pdu(pdu_hex: &str) -> Result<Sms> {
     } else {
         if is_ucs2 {
             decode_ucs2(user_data)
+        } else if is_8bit {
+            // 8-bit data: decode as lossy UTF-8, bounded by UDL bytes
+            let data = &user_data[..udl.min(user_data.len())];
+            String::from_utf8_lossy(data).into_owned()
         } else {
             decode_gsm7(user_data, 0, udl)
         }
@@ -137,10 +153,60 @@ fn parse_date(ts: &[u8]) -> String {
     let (min1, min2) = swap(ts[4]);
     let (s1, s2) = swap(ts[5]);
 
+    // Parse timezone byte (ts[6])
+    // Low nibble: bit 3 = sign (0=+, 1=-), bits 0-2 = tens of quarter-hours
+    // High nibble: bits 4-7 = units of quarter-hours
+    let tz_byte = ts[6];
+    let low_nibble = tz_byte & 0x0F;
+    let high_nibble = tz_byte >> 4;
+    let sign = if (low_nibble & 0x08) != 0 { '-' } else { '+' };
+    let tens = (low_nibble & 0x07) as i8;
+    let units = high_nibble as i8;
+    let quarter_hours = tens * 10 + units;
+    let hours = quarter_hours / 4;
+    let minutes = (quarter_hours % 4) * 15;
+
     format!(
-        "20{}{}/{}{}/{}{} {}{}:{}{}:{}{}",
-        y1, y2, m1, m2, d1, d2, h1, h2, min1, min2, s1, s2
+        "20{}{}/{}{}/{}{} {}{}:{}{}:{}{} {}{:02}:{:02}",
+        y1,
+        y2,
+        m1,
+        m2,
+        d1,
+        d2,
+        h1,
+        h2,
+        min1,
+        min2,
+        s1,
+        s2,
+        sign,
+        hours.abs(),
+        minutes
     )
+}
+
+// Decode DCS (Data Coding Scheme) byte according to 3GPP TS 23.038
+// Returns (is_ucs2, is_8bit, is_compressed)
+fn decode_dcs(dcs: u8) -> (bool, bool, bool) {
+    // Group 0xF0-0xFF: bit 2 selects alphabet (0=GSM-7, 1=8-bit)
+    if (dcs & 0xF0) == 0xF0 {
+        let is_8bit = (dcs & 0x04) != 0;
+        return (false, is_8bit, false);
+    }
+
+    // General group (bit 7 = 0): bits 3:2 = alphabet
+    // Bit 5 = compressed
+    let is_compressed = (dcs & 0x20) != 0;
+    let alphabet = (dcs >> 2) & 0x03;
+
+    match alphabet {
+        0b00 => (false, false, is_compressed), // GSM-7
+        0b01 => (false, true, is_compressed),  // 8-bit data
+        0b10 => (true, false, is_compressed),  // UCS2
+        0b11 => (false, false, is_compressed), // Reserved, treat as GSM-7
+        _ => unreachable!(),
+    }
 }
 
 pub fn hex_to_bytes(hex: &str) -> Result<Vec<u8>> {
