@@ -1,5 +1,6 @@
 pub mod codec;
 pub mod pdu;
+pub mod reassembler;
 pub mod sender;
 pub mod service;
 
@@ -24,6 +25,7 @@ pub struct ParseResult {
 }
 
 pub use pdu::{parse_pdu, parse_pdu_response, parse_pdu_with_udh};
+pub use reassembler::{CompletedMessage, Reassembler, ReassemblerConfig};
 pub use service::{AtPort, SmsService};
 
 #[cfg(test)]
