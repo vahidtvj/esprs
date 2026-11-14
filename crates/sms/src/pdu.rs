@@ -2,9 +2,14 @@ use anyhow::Result;
 
 use crate::codec::{decode_gsm7, decode_ucs2};
 use crate::sender::decode_sender;
-use crate::Sms;
+use crate::{Concat, ParseResult, Sms};
 
 pub fn parse_pdu(pdu_hex: &str) -> Result<Sms> {
+    let result = parse_pdu_with_udh(pdu_hex)?;
+    Ok(result.sms)
+}
+
+pub fn parse_pdu_with_udh(pdu_hex: &str) -> Result<ParseResult> {
     let bytes = hex_to_bytes(pdu_hex)?;
     if bytes.len() < 3 {
         anyhow::bail!("PDU too short");
@@ -80,12 +85,10 @@ pub fn parse_pdu(pdu_hex: &str) -> Result<Sms> {
         anyhow::bail!("Compressed DCS not supported");
     }
 
-    // Validate user data length
+    // Validate user data length (initial check - UDH will be validated separately if present)
     if is_ucs2 {
-        // UCS2: udl is number of octets (bytes), must be even (2 bytes per char)
-        if udl % 2 != 0 {
-            anyhow::bail!("UCS2 UDL must be even");
-        }
+        // UCS2: udl is number of octets (bytes)
+        // If UDH is present, UDL includes UDH bytes, so we only check minimum length here
         if user_data.len() < udl {
             anyhow::bail!("UCS2 user data truncated");
         }
@@ -104,29 +107,14 @@ pub fn parse_pdu(pdu_hex: &str) -> Result<Sms> {
 
     // Check UDHI (User Data Header Indicator) - bit 6 of first_octet
     let has_udh = (first_octet & 0x40) != 0;
-    let message = if has_udh {
-        if user_data.is_empty() {
-            anyhow::bail!("UDH indicated but no user data");
-        }
-        let udhl = user_data[0] as usize;
-        if user_data.len() < 1 + udhl {
-            anyhow::bail!("UDH length exceeds user data");
-        }
-        // Skip UDH (1 byte UDHL + udhl bytes UDH), decode the rest
-        let message_data = &user_data[1 + udhl..];
-        if is_ucs2 {
-            decode_ucs2(message_data)
-        } else if is_8bit {
-            // 8-bit data with UDH: decode remaining bytes as lossy UTF-8
-            String::from_utf8_lossy(message_data).into_owned()
-        } else {
-            // For GSM7 with UDH, the UDL includes UDH septets.
-            // We need to recalculate septet count for message only.
-            // This is complex; for now just decode with remaining data
-            decode_gsm7(message_data, 0, udl)
-        }
+    let (message, concat) = if has_udh {
+        parse_udh(user_data, udl, is_ucs2, is_8bit)?
     } else {
-        if is_ucs2 {
+        // For non-UDH, validate UCS2 UDL is even
+        if is_ucs2 && udl % 2 != 0 {
+            anyhow::bail!("UCS2 UDL must be even");
+        }
+        let message = if is_ucs2 {
             decode_ucs2(user_data)
         } else if is_8bit {
             // 8-bit data: decode as lossy UTF-8, bounded by UDL bytes
@@ -134,14 +122,133 @@ pub fn parse_pdu(pdu_hex: &str) -> Result<Sms> {
             String::from_utf8_lossy(data).into_owned()
         } else {
             decode_gsm7(user_data, 0, udl)
-        }
+        };
+        (message, None)
     };
 
-    Ok(Sms {
-        sender,
-        date,
-        message,
+    Ok(ParseResult {
+        sms: Sms {
+            sender,
+            date,
+            message,
+        },
+        concat,
     })
+}
+
+fn parse_udh(
+    user_data: &[u8],
+    udl: usize,
+    is_ucs2: bool,
+    is_8bit: bool,
+) -> Result<(String, Option<Concat>)> {
+    if user_data.is_empty() {
+        anyhow::bail!("UDH indicated but no user data");
+    }
+    let udhl = user_data[0] as usize;
+    if user_data.len() < 1 + udhl {
+        anyhow::bail!("UDH length exceeds user data");
+    }
+
+    let udh = &user_data[1..1 + udhl];
+    let concat = parse_concat_ie(udh)?;
+
+    // Calculate message data after UDH
+    let message_data = &user_data[1 + udhl..];
+
+    let message = if is_ucs2 {
+        // UCS2: UDL is bytes, subtract UDHL+1 bytes
+        let expected_msg_bytes = udl.saturating_sub(udhl + 1);
+        if message_data.len() < expected_msg_bytes {
+            anyhow::bail!("UCS2 message data truncated after UDH");
+        }
+        // UCS2 message part must be even number of bytes
+        if expected_msg_bytes % 2 != 0 {
+            anyhow::bail!("UCS2 message part after UDH must be even");
+        }
+        let msg_bytes = &message_data[..expected_msg_bytes.min(message_data.len())];
+        decode_ucs2(msg_bytes)
+    } else if is_8bit {
+        // 8-bit: UDL is bytes, subtract UDHL+1 bytes
+        let expected_msg_bytes = udl.saturating_sub(udhl + 1);
+        let msg_bytes = &message_data[..expected_msg_bytes.min(message_data.len())];
+        String::from_utf8_lossy(msg_bytes).into_owned()
+    } else {
+        // GSM-7: UDL is septets
+        // padding bits = (7 - (8*(UDHL+1)) % 7) % 7
+        let udh_bytes = udhl + 1; // UDHL + 1 byte for UDHL itself
+        let udh_bits = udh_bytes * 8;
+        let padding_bits = (7 - (udh_bits % 7)) % 7;
+        let udh_septets = (udh_bits + 6) / 7; // ceil(udh_bits / 7)
+        let msg_septets = udl.saturating_sub(udh_septets);
+        decode_gsm7(message_data, padding_bits as u8, msg_septets)
+    };
+
+    Ok((message, concat))
+}
+
+fn parse_concat_ie(udh: &[u8]) -> Result<Option<Concat>> {
+    let mut i = 0;
+    while i < udh.len() {
+        if i + 1 >= udh.len() {
+            anyhow::bail!("UDH truncated: missing IE length");
+        }
+        let ie_id = udh[i];
+        let ie_len = udh[i + 1] as usize;
+        if i + 2 + ie_len > udh.len() {
+            anyhow::bail!("UDH truncated: IE data exceeds UDH length");
+        }
+        let ie_data = &udh[i + 2..i + 2 + ie_len];
+
+        match ie_id {
+            0x00 => {
+                // 8-bit reference number: ref(1), total(1), seq(1)
+                if ie_len < 3 {
+                    anyhow::bail!("Concat IE 0x00 too short");
+                }
+                let ref_num = ie_data[0] as u16;
+                let total = ie_data[1];
+                let seq = ie_data[2];
+                if total == 0 {
+                    anyhow::bail!("Concat total must be >= 1");
+                }
+                if seq == 0 || seq > total {
+                    anyhow::bail!("Concat seq must be 1..total");
+                }
+                return Ok(Some(Concat {
+                    ref_num,
+                    total,
+                    seq,
+                }));
+            }
+            0x08 => {
+                // 16-bit reference number: ref(2), total(1), seq(1)
+                if ie_len < 4 {
+                    anyhow::bail!("Concat IE 0x08 too short");
+                }
+                let ref_num = u16::from_be_bytes([ie_data[0], ie_data[1]]);
+                let total = ie_data[2];
+                let seq = ie_data[3];
+                if total == 0 {
+                    anyhow::bail!("Concat total must be >= 1");
+                }
+                if seq == 0 || seq > total {
+                    anyhow::bail!("Concat seq must be 1..total");
+                }
+                return Ok(Some(Concat {
+                    ref_num,
+                    total,
+                    seq,
+                }));
+            }
+            _ => {
+                // Ignore other IEs
+            }
+        }
+
+        i += 2 + ie_len;
+    }
+    Ok(None)
 }
 
 fn parse_date(ts: &[u8]) -> String {

@@ -10,7 +10,20 @@ pub struct Sms {
     pub message: String,
 }
 
-pub use pdu::{parse_pdu, parse_pdu_response};
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Concat {
+    pub ref_num: u16,
+    pub total: u8,
+    pub seq: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseResult {
+    pub sms: Sms,
+    pub concat: Option<Concat>,
+}
+
+pub use pdu::{parse_pdu, parse_pdu_response, parse_pdu_with_udh};
 pub use service::{AtPort, SmsService};
 
 #[cfg(test)]
@@ -174,5 +187,173 @@ mod tests {
         assert!(pdu::hex_to_bytes("00").is_ok());
         assert!(pdu::hex_to_bytes("FF").is_ok());
         assert!(pdu::hex_to_bytes("0123456789ABCDEF").is_ok());
+    }
+
+    #[test]
+    fn test_concat_cases() {
+        use crate::test_vectors::concat_cases::*;
+        let cases = [
+            (GSM7_2A_P1, "GSM7_2A_P1"),
+            (GSM7_2A_P2, "GSM7_2A_P2"),
+            (UCS2_07_P1, "UCS2_07_P1"),
+            (UCS2_07_P2, "UCS2_07_P2"),
+            (UCS2_1234_P1, "UCS2_1234_P1"),
+            (UCS2_1234_P2, "UCS2_1234_P2"),
+            (GSM7_10_P1, "GSM7_10_P1"),
+            (GSM7_10_P2, "GSM7_10_P2"),
+            (GSM7_10_P3, "GSM7_10_P3"),
+            (OTHER_2A_P1, "OTHER_2A_P1"),
+        ];
+        for (case, name) in cases {
+            let (
+                pdu,
+                expected_sender,
+                expected_message,
+                expected_ref,
+                expected_total,
+                expected_seq,
+            ) = case;
+            let result = parse_pdu_with_udh(pdu)
+                .unwrap_or_else(|e| panic!("Failed to parse {}: {}", name, e));
+            assert_eq!(
+                result.sms.sender, expected_sender,
+                "Sender mismatch for {}",
+                name
+            );
+            assert_eq!(
+                result.sms.message, expected_message,
+                "Message mismatch for {}",
+                name
+            );
+            let concat = result
+                .concat
+                .unwrap_or_else(|| panic!("Expected concat info for {}", name));
+            assert_eq!(concat.ref_num, expected_ref, "Ref mismatch for {}", name);
+            assert_eq!(concat.total, expected_total, "Total mismatch for {}", name);
+            assert_eq!(concat.seq, expected_seq, "Seq mismatch for {}", name);
+        }
+    }
+
+    #[test]
+    fn test_err_udh_cases() {
+        use crate::test_vectors::err_udh::CASES;
+        for case in CASES {
+            let result = parse_pdu_with_udh(case);
+            assert!(result.is_err(), "Expected Err for case: {}", case);
+        }
+    }
+
+    #[test]
+    fn test_concat_invalid_total_zero() {
+        // Build a PDU based on GSM7_2A_P1 but with total=0
+        // Original: GSM7_2A_P1 has concat IE 0x00 0x03 0x2A 0x02 0x01 (ref=0x2A, total=2, seq=1)
+        // Modify to total=0: 0x00 0x03 0x2A 0x00 0x01
+        let pdu = "0791893905004100440C91892910325476000062110171918540170500032A000182C16030180C0683416499CD7E8300";
+        let result = parse_pdu_with_udh(pdu);
+        assert!(result.is_err(), "Expected Err for total=0");
+    }
+
+    #[test]
+    fn test_concat_invalid_seq_zero() {
+        // Build a PDU based on GSM7_2A_P1 but with seq=0
+        // Original: GSM7_2A_P1 has concat IE 0x00 0x03 0x2A 0x02 0x01 (ref=0x2A, total=2, seq=1)
+        // Modify to seq=0: 0x00 0x03 0x2A 0x02 0x00
+        let pdu = "0791893905004100440C91892910325476000062110171918540170500032A020082C16030180C0683416499CD7E8300";
+        let result = parse_pdu_with_udh(pdu);
+        assert!(result.is_err(), "Expected Err for seq=0");
+    }
+
+    #[test]
+    fn test_concat_invalid_seq_gt_total() {
+        // Build a PDU based on GSM7_2A_P1 but with seq=3 (total=2)
+        // Original: GSM7_2A_P1 has concat IE 0x00 0x03 0x2A 0x02 0x01 (ref=0x2A, total=2, seq=1)
+        // Modify to seq=3: 0x00 0x03 0x2A 0x02 0x03
+        let pdu = "0791893905004100440C91892910325476000062110171918540170500032A020382C16030180C0683416499CD7E8300";
+        let result = parse_pdu_with_udh(pdu);
+        assert!(result.is_err(), "Expected Err for seq > total");
+    }
+
+    #[test]
+    fn test_concat_unknown_ie_before_concat() {
+        // Build a PDU with an unknown IE (0x01) before the concat IE (0x00)
+        // Using UCS2 to avoid GSM-7 padding complexity
+        // Based on UCS2_07_P1 but with an unknown IE before the concat IE
+        // Original UCS2_07_P1: 0791893905004100440C918929103254760008621101719185401005000307020106330644062706450020
+        // Breakdown:
+        // UDL=0x10 (16 bytes)
+        // UDH: 05 00 03 07 02 01 (UDHL=5, concat IE 0x00 ref=7 total=2 seq=1)
+        // Message: 06330644062706450020 (10 bytes = "سلام ")
+        //
+        // With unknown IE 0x01 len=2 before concat:
+        // UDH: 09 01 02 AA BB 00 03 07 02 01 (UDHL=9, unknown IE + concat IE)
+        // Extra 4 bytes UDH = UDL increases by 4
+        // New UDL = 16 + 4 = 20 (0x14)
+        // UDH at start of user_data: 09 01 02 AA BB 00 03 07 02 01
+        // Message same: 06330644062706450020
+
+        let pdu = "0791893905004100440C9189291032547600086211017191854014090102AABB000307020106330644062706450020";
+        let result = parse_pdu_with_udh(pdu).unwrap_or_else(|e| panic!("Failed to parse: {}", e));
+        // Just verify concat info is extracted correctly; message may vary
+        let concat = result.concat.unwrap();
+        assert_eq!(concat.ref_num, 0x07);
+        assert_eq!(concat.total, 2);
+        assert_eq!(concat.seq, 1);
+    }
+
+    #[test]
+    fn test_parse_pdu_backward_compat() {
+        // Ensure existing parse_pdu still works and returns Sms
+        let pdu = "0791893905004100040C9189291032547600006211017191854102C834";
+        let sms = parse_pdu(pdu).unwrap();
+        assert_eq!(sms.sender, "+989201234567");
+        assert_eq!(sms.message, "Hi");
+    }
+
+    #[test]
+    fn test_parse_pdu_with_udh_no_udhi() {
+        // Test parse_pdu_with_udh on non-UDH PDU
+        let pdu = "0791893905004100040C9189291032547600006211017191854102C834";
+        let result = parse_pdu_with_udh(pdu).unwrap();
+        assert_eq!(result.sms.sender, "+989201234567");
+        assert_eq!(result.sms.message, "Hi");
+        assert!(result.concat.is_none());
+    }
+
+    #[test]
+    fn test_concat_16bit_ref() {
+        // Test UCS2_1234_P1 and UCS2_1234_P2 which use 16-bit ref (IE 0x08)
+        use crate::test_vectors::concat_cases::*;
+        let cases = [
+            (UCS2_1234_P1, "UCS2_1234_P1"),
+            (UCS2_1234_P2, "UCS2_1234_P2"),
+        ];
+        for (case, name) in cases {
+            let (
+                pdu,
+                expected_sender,
+                expected_message,
+                expected_ref,
+                expected_total,
+                expected_seq,
+            ) = case;
+            let result = parse_pdu_with_udh(pdu)
+                .unwrap_or_else(|e| panic!("Failed to parse {}: {}", name, e));
+            assert_eq!(
+                result.sms.sender, expected_sender,
+                "Sender mismatch for {}",
+                name
+            );
+            assert_eq!(
+                result.sms.message, expected_message,
+                "Message mismatch for {}",
+                name
+            );
+            let concat = result
+                .concat
+                .unwrap_or_else(|| panic!("Expected concat info for {}", name));
+            assert_eq!(concat.ref_num, expected_ref, "Ref mismatch for {}", name);
+            assert_eq!(concat.total, expected_total, "Total mismatch for {}", name);
+            assert_eq!(concat.seq, expected_seq, "Seq mismatch for {}", name);
+        }
     }
 }
