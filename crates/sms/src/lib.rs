@@ -1,3 +1,4 @@
+pub mod at_port;
 pub mod codec;
 pub mod pdu;
 pub mod reassembler;
@@ -24,9 +25,12 @@ pub struct ParseResult {
     pub concat: Option<Concat>,
 }
 
+pub use at_port::{
+    poll_urcs, send_command, AtError, AtPortRaw, AtState, Clock, MockClock, SystemClock,
+};
 pub use pdu::{parse_pdu, parse_pdu_response, parse_pdu_with_udh, parse_pdu_with_udh_response};
 pub use reassembler::{CompletedMessage, Reassembler, ReassemblerConfig};
-pub use service::{AtPort, Clock, SmsService, SystemClock};
+pub use service::SmsService;
 
 #[cfg(test)]
 mod test_vectors;

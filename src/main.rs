@@ -1,8 +1,9 @@
 use anyhow::Result;
+use esp_idf_svc::hal::delay::TickType;
 use esp_idf_svc::hal::peripherals::Peripherals;
 use esp_idf_svc::hal::uart::*;
 use power::{PowerControl, SimcomPower};
-use sms::{AtPort, Sms, SmsService};
+use sms::{AtPortRaw, Sms, SmsService};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -12,108 +13,29 @@ use pinout::*;
 
 struct UartAtPort<'d> {
     driver: UartDriver<'d>,
-    urc_cb: Option<Box<dyn FnMut(&str) + Send + 'static>>,
 }
 
 impl<'d> UartAtPort<'d> {
     fn new(driver: UartDriver<'d>) -> Self {
-        Self {
-            driver,
-            urc_cb: None,
-        }
+        Self { driver }
     }
 }
 
-impl<'d> AtPort for UartAtPort<'d> {
-    fn send_command(&mut self, cmd: &str, timeout: Duration) -> Result<Vec<String>> {
-        let full_cmd = format!("{}\r\n", cmd);
-        log::debug!(target: "uart", ">> {}", cmd);
-        self.driver.write(full_cmd.as_bytes())?;
-
-        let mut lines = Vec::new();
-        let mut buf = [0u8; 256];
-        let mut line_buf = String::new();
-        let timeout_ticks = (timeout.as_millis() / 10) as usize;
-        let mut got_response = false;
-
-        for _ in 0..timeout_ticks {
-            if let Ok(len) = self.driver.read(&mut buf, 10) {
-                if len > 0 {
-                    let s = String::from_utf8_lossy(&buf[..len]);
-                    for c in s.chars() {
-                        if c == '\n' {
-                            let line = line_buf.trim().to_string();
-                            line_buf.clear();
-                            if !line.is_empty() {
-                                log::debug!(target: "uart", "<< {}", line);
-                                if line.starts_with("+CMTI:") {
-                                    if let Some(ref mut cb) = self.urc_cb {
-                                        cb(&line);
-                                    }
-                                } else if line == "OK"
-                                    || line == "ERROR"
-                                    || line.starts_with("+CME ERROR")
-                                {
-                                    lines.push(line.clone());
-                                    got_response = true;
-                                    break;
-                                } else {
-                                    lines.push(line.clone());
-                                }
-                            }
-                        } else if c != '\r' {
-                            line_buf.push(c);
-                        }
-                    }
-                }
-            }
-            if got_response {
-                break;
-            }
-        }
-        Ok(lines)
+impl<'d> AtPortRaw for UartAtPort<'d> {
+    fn write_raw(&mut self, data: &[u8]) -> Result<()> {
+        log::debug!(target: "uart", ">> {}", String::from_utf8_lossy(data).trim());
+        self.driver.write(data)?;
+        Ok(())
     }
 
-    fn on_urc(&mut self, callback: Box<dyn FnMut(&str) + Send + 'static>) {
-        self.urc_cb = Some(callback);
-    }
-
-    fn poll(&mut self, timeout: Duration) -> Result<Option<u8>> {
-        let mut buf = [0u8; 256];
-        let mut line_buf = String::new();
-        let timeout_ticks = (timeout.as_millis() / 10) as usize;
-
-        for _ in 0..timeout_ticks {
-            if let Ok(len) = self.driver.read(&mut buf, 10) {
-                if len > 0 {
-                    let s = String::from_utf8_lossy(&buf[..len]);
-                    for c in s.chars() {
-                        if c == '\n' {
-                            let line = line_buf.trim().to_string();
-                            line_buf.clear();
-                            if !line.is_empty() {
-                                log::debug!(target: "uart", "<< (poll) {}", line);
-                                if line.starts_with("+CMTI:") {
-                                    if let Some(ref mut cb) = self.urc_cb {
-                                        cb(&line);
-                                    }
-                                    if let Some(comma_pos) = line.find(',') {
-                                        if let Ok(index) =
-                                            line[comma_pos + 1..].trim().parse::<u8>()
-                                        {
-                                            return Ok(Some(index));
-                                        }
-                                    }
-                                }
-                            }
-                        } else if c != '\r' {
-                            line_buf.push(c);
-                        }
-                    }
-                }
-            }
+    fn read_raw(&mut self, buf: &mut [u8], timeout: Duration) -> Result<usize> {
+        // Convert Duration to FreeRTOS ticks
+        let ticks = TickType::new_millis(timeout.as_millis() as u64).ticks();
+        let len = self.driver.read(buf, ticks)?;
+        if len > 0 {
+            log::debug!(target: "uart", "<< (raw) {}", String::from_utf8_lossy(&buf[..len]).trim());
         }
-        Ok(None)
+        Ok(len)
     }
 }
 

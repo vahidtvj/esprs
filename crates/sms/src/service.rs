@@ -1,49 +1,33 @@
 use anyhow::Result;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use crate::at_port::{poll_urcs, send_command, AtPortRaw, AtState, Clock, SystemClock};
 use crate::reassembler::{CompletedMessage, Reassembler, ReassemblerConfig};
 use crate::{ParseResult, Sms};
 
-/// Trait for injectable clock - allows testing with mocked time
-pub trait Clock {
-    fn now(&self) -> Instant;
-}
-
-/// Real clock using system time
-pub struct SystemClock;
-
-impl Clock for SystemClock {
-    fn now(&self) -> Instant {
-        Instant::now()
-    }
-}
-
-pub trait AtPort {
-    fn send_command(&mut self, cmd: &str, timeout: Duration) -> Result<Vec<String>>;
-    fn on_urc(&mut self, callback: Box<dyn FnMut(&str) + Send + 'static>);
-    fn poll(&mut self, timeout: Duration) -> Result<Option<u8>>;
-}
-
-pub struct SmsService<P: AtPort, C: Clock> {
+pub struct SmsService<P: AtPortRaw, C: Clock> {
     port: P,
     callback: Option<Box<dyn FnMut(Sms) + Send + 'static>>,
     reassembler: Reassembler,
     clock: C,
+    /// AT state for line framing and URC handling
+    at_state: AtState,
 }
 
-impl<P: AtPort> SmsService<P, SystemClock> {
+impl<P: AtPortRaw> SmsService<P, SystemClock> {
     pub fn new(port: P) -> Self {
         Self::with_clock(port, SystemClock)
     }
 }
 
-impl<P: AtPort, C: Clock> SmsService<P, C> {
+impl<P: AtPortRaw, C: Clock> SmsService<P, C> {
     pub fn with_clock(port: P, clock: C) -> Self {
         Self {
             port,
             callback: None,
             reassembler: Reassembler::new(),
             clock,
+            at_state: AtState::new(),
         }
     }
 
@@ -53,35 +37,60 @@ impl<P: AtPort, C: Clock> SmsService<P, C> {
             callback: None,
             reassembler: Reassembler::with_config(config),
             clock,
+            at_state: AtState::new(),
         }
     }
 
     pub fn init(&mut self) -> Result<()> {
-        self.port
-            .send_command("AT+CMGF=0", Duration::from_secs(3))?;
-        self.port
-            .send_command("AT+CSCS=\"UCS2\"", Duration::from_secs(3))?;
-        self.port
-            .send_command("AT+CNMI=2,1,0,0,0", Duration::from_secs(3))?;
+        send_command(
+            &mut self.port,
+            &self.clock,
+            "AT+CMGF=0",
+            Duration::from_secs(3),
+            &mut self.at_state,
+        )?;
+        send_command(
+            &mut self.port,
+            &self.clock,
+            "AT+CSCS=\"UCS2\"",
+            Duration::from_secs(3),
+            &mut self.at_state,
+        )?;
+        send_command(
+            &mut self.port,
+            &self.clock,
+            "AT+CNMI=2,1,0,0,0",
+            Duration::from_secs(3),
+            &mut self.at_state,
+        )?;
         Ok(())
     }
 
     /// Read SMS and return full ParseResult including concat info
-    pub fn read_with_concat(&mut self, index: u8) -> Result<ParseResult> {
-        let lines = self
-            .port
-            .send_command(&format!("AT+CMGR={index}"), Duration::from_secs(5))?;
+    pub fn read_with_concat(&mut self, index: u16) -> Result<ParseResult> {
+        let lines = send_command(
+            &mut self.port,
+            &self.clock,
+            &format!("AT+CMGR={index}"),
+            Duration::from_secs(5),
+            &mut self.at_state,
+        )?;
         crate::pdu::parse_pdu_with_udh_response(&lines)
     }
 
     /// Read SMS (backward compatible - returns only Sms)
-    pub fn read(&mut self, index: u8) -> Result<Sms> {
+    pub fn read(&mut self, index: u16) -> Result<Sms> {
         self.read_with_concat(index).map(|r| r.sms)
     }
 
-    pub fn delete(&mut self, index: u8) -> Result<()> {
-        self.port
-            .send_command(&format!("AT+CMGD={index}"), Duration::from_secs(3))?;
+    pub fn delete(&mut self, index: u16) -> Result<()> {
+        send_command(
+            &mut self.port,
+            &self.clock,
+            &format!("AT+CMGD={index}"),
+            Duration::from_secs(3),
+            &mut self.at_state,
+        )?;
         Ok(())
     }
 
@@ -96,7 +105,7 @@ impl<P: AtPort, C: Clock> SmsService<P, C> {
         let now = self.clock.now();
 
         // Check for new incoming SMS
-        if let Some(index) = self.port.poll(timeout)? {
+        if let Some(index) = poll_urcs(&mut self.port, &self.clock, &mut self.at_state, timeout)? {
             log::info!("Incoming SMS notification at index {}, reading...", index);
             match self.read_with_concat(index) {
                 Ok(parse_result) => {
@@ -105,7 +114,7 @@ impl<P: AtPort, C: Clock> SmsService<P, C> {
                         parse_result.sms.sender
                     );
                     let completed = self.reassembler.feed(
-                        index as u16,
+                        index,
                         &parse_result.sms.sender,
                         &parse_result.sms.date,
                         &parse_result.sms.message,
@@ -138,7 +147,7 @@ impl<P: AtPort, C: Clock> SmsService<P, C> {
             }
             // Delete all indices for this group
             for index in msg.indices {
-                let _ = self.delete(index as u8);
+                let _ = self.delete(index);
             }
         }
         Ok(())
@@ -148,6 +157,7 @@ impl<P: AtPort, C: Clock> SmsService<P, C> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::at_port::{AtPortRaw, MockClock};
     use crate::test_vectors::concat_cases::*;
     use crate::test_vectors::ok_cases::GSM7_HI;
     use crate::Sms;
@@ -155,96 +165,83 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
-    /// Mock clock that allows controlling time
-    #[derive(Clone)]
-    struct MockClock {
-        now: Arc<Mutex<Instant>>,
-    }
-
-    impl MockClock {
-        fn new(start: Instant) -> Self {
-            Self {
-                now: Arc::new(Mutex::new(start)),
-            }
-        }
-
-        fn advance(&self, dur: Duration) {
-            *self.now.lock().unwrap() += dur;
-        }
-    }
-
-    impl Clock for MockClock {
-        fn now(&self) -> Instant {
-            *self.now.lock().unwrap()
-        }
-    }
-
-    /// Mock AT port for testing
-    struct MockAtPort {
+    /// Mock raw port for testing SmsService
+    struct MockRawPort {
         /// Queue of (index, PDU response lines) for CMGR reads
-        cmgr_responses: Mutex<VecDeque<(u8, Vec<String>)>>,
-        /// Queue of CMTI indices to return from poll
-        cmti_queue: Mutex<VecDeque<u8>>,
+        cmgr_responses: Mutex<VecDeque<(u16, Vec<String>)>>,
+        /// Queue of raw byte chunks to return on read
+        read_queue: Mutex<VecDeque<Vec<u8>>>,
         /// Record of CMGD commands sent
-        deleted_indices: Mutex<Vec<u8>>,
+        deleted_indices: Mutex<Vec<u16>>,
     }
 
-    impl MockAtPort {
+    impl MockRawPort {
         fn new() -> Self {
             Self {
                 cmgr_responses: Mutex::new(VecDeque::new()),
-                cmti_queue: Mutex::new(VecDeque::new()),
+                read_queue: Mutex::new(VecDeque::new()),
                 deleted_indices: Mutex::new(Vec::new()),
             }
         }
 
-        /// Add a CMGR response for a specific index
-        fn add_cmgr_response(&self, index: u8, lines: Vec<String>) {
+        /// Add a CMGR response for a specific index (as raw bytes)
+        fn add_cmgr_response(&self, index: u16, lines: Vec<String>) {
             self.cmgr_responses
                 .lock()
                 .unwrap()
                 .push_back((index, lines));
         }
 
-        /// Add a CMTI notification index
-        fn add_cmti(&self, index: u8) {
-            self.cmti_queue.lock().unwrap().push_back(index);
+        /// Add raw bytes to the read queue
+        fn push_read(&self, data: Vec<u8>) {
+            self.read_queue.lock().unwrap().push_back(data);
         }
 
         /// Get deleted indices
-        fn get_deleted(&self) -> Vec<u8> {
+        fn get_deleted(&self) -> Vec<u16> {
             self.deleted_indices.lock().unwrap().clone()
         }
     }
 
-    impl AtPort for MockAtPort {
-        fn send_command(&mut self, cmd: &str, _timeout: Duration) -> Result<Vec<String>> {
+    impl AtPortRaw for MockRawPort {
+        fn write_raw(&mut self, data: &[u8]) -> Result<()> {
+            // Parse the command to determine what response to queue
+            let cmd = String::from_utf8_lossy(data).trim().to_string();
 
             if cmd.starts_with("AT+CMGR=") {
                 let mut responses = self.cmgr_responses.lock().unwrap();
                 if let Some((idx, lines)) = responses.pop_front() {
-                    // Verify index matches
-                    let expected_idx = cmd["AT+CMGR=".len()..].parse::<u8>().unwrap();
+                    let expected_idx = cmd["AT+CMGR=".len()..].parse::<u16>().unwrap();
                     assert_eq!(idx, expected_idx, "CMGR index mismatch");
-                    return Ok(lines);
+                    // Queue the response as raw bytes
+                    let response = lines.join("\r\n") + "\r\n";
+                    self.push_read(response.into_bytes());
+                    return Ok(());
                 }
                 anyhow::bail!("No CMGR response queued for index");
             } else if cmd.starts_with("AT+CMGD=") {
-                let idx = cmd["AT+CMGD=".len()..].parse::<u8>().unwrap();
+                let idx = cmd["AT+CMGD=".len()..].parse::<u16>().unwrap();
                 self.deleted_indices.lock().unwrap().push(idx);
-                return Ok(vec!["OK".to_string()]);
+                self.push_read(b"OK\r\n".to_vec());
+                return Ok(());
             }
             // For init commands, return OK
-            Ok(vec!["OK".to_string()])
+            self.push_read(b"OK\r\n".to_vec());
+            Ok(())
         }
 
-        fn on_urc(&mut self, _callback: Box<dyn FnMut(&str) + Send + 'static>) {
-            // Not used in tests
-        }
-
-        fn poll(&mut self, _timeout: Duration) -> Result<Option<u8>> {
-            let mut queue = self.cmti_queue.lock().unwrap();
-            Ok(queue.pop_front())
+        fn read_raw(&mut self, buf: &mut [u8], _timeout: Duration) -> Result<usize> {
+            let mut queue = self.read_queue.lock().unwrap();
+            if queue.is_empty() {
+                return Ok(0);
+            }
+            let data = queue.pop_front().unwrap();
+            let len = data.len().min(buf.len());
+            buf[..len].copy_from_slice(&data[..len]);
+            if data.len() > len {
+                queue.push_front(data[len..].to_vec());
+            }
+            Ok(len)
         }
     }
 
@@ -265,13 +262,17 @@ mod tests {
         let p2_pdu = GSM7_10_P2.0;
         let p3_pdu = GSM7_10_P3.0;
 
-        let port = MockAtPort::new();
-        port.add_cmti(4);
-        port.add_cmti(5);
-        port.add_cmti(6);
+        let port = MockRawPort::new();
+        // Queue CMTI notifications as raw bytes - but we need to interleave them with CMGR responses
+        // The issue is that send_command reads from the queue, so we need to queue CMGR responses
+        // at the right time. Let's use the write_raw hook to queue CMGR responses.
         port.add_cmgr_response(4, cmgr_lines(p1_pdu));
         port.add_cmgr_response(5, cmgr_lines(p2_pdu));
         port.add_cmgr_response(6, cmgr_lines(p3_pdu));
+        // Pre-queue CMTI notifications - they will be read by poll_urcs
+        port.push_read(b"\r\n+CMTI: \"SM\",4\r\n".to_vec());
+        port.push_read(b"\r\n+CMTI: \"SM\",5\r\n".to_vec());
+        port.push_read(b"\r\n+CMTI: \"SM\",6\r\n".to_vec());
 
         let clock = MockClock::new(Instant::now());
         let mut service = SmsService::with_clock(port, clock);
@@ -305,9 +306,9 @@ mod tests {
         // Only P1 arrives at index 4
         let p1_pdu = GSM7_10_P1.0;
 
-        let port = MockAtPort::new();
-        port.add_cmti(4);
+        let port = MockRawPort::new();
         port.add_cmgr_response(4, cmgr_lines(p1_pdu));
+        port.push_read(b"\r\n+CMTI: \"SM\",4\r\n".to_vec());
 
         let start = Instant::now();
         let clock = MockClock::new(start);
@@ -346,9 +347,9 @@ mod tests {
         // Plain GSM7_HI message
         let pdu = GSM7_HI.0;
 
-        let port = MockAtPort::new();
-        port.add_cmti(7);
+        let port = MockRawPort::new();
         port.add_cmgr_response(7, cmgr_lines(pdu));
+        port.push_read(b"\r\n+CMTI: \"SM\",7\r\n".to_vec());
 
         let clock = MockClock::new(Instant::now());
         let mut service = SmsService::with_clock(port, clock);
