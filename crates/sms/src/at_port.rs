@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 /// Trait for injectable clock - allows testing with mocked time
 pub trait Clock {
     fn now(&self) -> Instant;
+    fn sleep(&self, dur: Duration);
 }
 
 /// Real clock using system time
@@ -12,6 +13,10 @@ pub struct SystemClock;
 impl Clock for SystemClock {
     fn now(&self) -> Instant {
         Instant::now()
+    }
+
+    fn sleep(&self, dur: Duration) {
+        std::thread::sleep(dur);
     }
 }
 
@@ -311,6 +316,10 @@ impl Clock for MockClock {
         let step = *self.auto_advance.lock().unwrap();
         *now += step;
         *now
+    }
+
+    fn sleep(&self, dur: Duration) {
+        self.advance(dur);
     }
 }
 

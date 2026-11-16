@@ -1,9 +1,33 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::time::Duration;
 
 use crate::at_port::{poll_urcs, send_command, AtPortRaw, AtState, Clock, SystemClock};
 use crate::reassembler::{CompletedMessage, Reassembler, ReassemblerConfig};
 use crate::{ParseResult, Sms};
+
+/// Storage location for SMS messages
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SmsStorage {
+    /// SIM card storage
+    SM,
+    /// Mobile equipment (internal) storage
+    ME,
+}
+
+impl SmsStorage {
+    fn as_str(&self) -> &'static str {
+        match self {
+            SmsStorage::SM => "SM",
+            SmsStorage::ME => "ME",
+        }
+    }
+}
+
+impl Default for SmsStorage {
+    fn default() -> Self {
+        SmsStorage::SM
+    }
+}
 
 pub struct SmsService<P: AtPortRaw, C: Clock> {
     port: P,
@@ -12,22 +36,33 @@ pub struct SmsService<P: AtPortRaw, C: Clock> {
     clock: C,
     /// AT state for line framing and URC handling
     at_state: AtState,
+    /// SMS storage location (ME or SM)
+    storage: SmsStorage,
 }
 
 impl<P: AtPortRaw> SmsService<P, SystemClock> {
     pub fn new(port: P) -> Self {
         Self::with_clock(port, SystemClock)
     }
+
+    pub fn with_storage(port: P, storage: SmsStorage) -> Self {
+        Self::with_clock_and_storage(port, SystemClock, storage)
+    }
 }
 
 impl<P: AtPortRaw, C: Clock> SmsService<P, C> {
     pub fn with_clock(port: P, clock: C) -> Self {
+        Self::with_clock_and_storage(port, clock, SmsStorage::default())
+    }
+
+    pub fn with_clock_and_storage(port: P, clock: C, storage: SmsStorage) -> Self {
         Self {
             port,
             callback: None,
             reassembler: Reassembler::new(),
             clock,
             at_state: AtState::new(),
+            storage,
         }
     }
 
@@ -38,31 +73,161 @@ impl<P: AtPortRaw, C: Clock> SmsService<P, C> {
             reassembler: Reassembler::with_config(config),
             clock,
             at_state: AtState::new(),
+            storage: SmsStorage::default(),
         }
     }
 
+    /// Initialize the modem for SMS operation
     pub fn init(&mut self) -> Result<()> {
+        // 1. AT sync with retries and delay (modem may not be ready after power-on)
+        self.at_sync()?;
+
+        // 2. ATE0 - disable command echo
+        send_command(
+            &mut self.port,
+            &self.clock,
+            "ATE0",
+            Duration::from_secs(3),
+            &mut self.at_state,
+        )
+        .context("failed to disable echo (ATE0)")?;
+
+        // 3. AT+CPIN? must report READY, else Err
+        let lines = send_command(
+            &mut self.port,
+            &self.clock,
+            "AT+CPIN?",
+            Duration::from_secs(5),
+            &mut self.at_state,
+        )
+        .context("failed to query SIM PIN status (AT+CPIN?)")?;
+
+        if !lines.iter().any(|line| line.contains("+CPIN: READY")) {
+            anyhow::bail!("SIM not ready: {}", lines.join(", "));
+        }
+
+        // 4. Network registration via AT+CREG?/AT+CEREG?, bounded wait; log and continue on timeout
+        self.wait_for_network_registration()?;
+
+        // 5. AT+CMGF=0 - PDU mode
         send_command(
             &mut self.port,
             &self.clock,
             "AT+CMGF=0",
             Duration::from_secs(3),
             &mut self.at_state,
-        )?;
+        )
+        .context("failed to set PDU mode (AT+CMGF=0)")?;
+
+        // 6. AT+CPMS set explicitly to one storage for read, delete and receive
+        let storage_str = self.storage.as_str();
+        let cpms_cmd = format!(
+            "AT+CPMS=\"{}\",\"{}\",\"{}\"",
+            storage_str, storage_str, storage_str
+        );
         send_command(
             &mut self.port,
             &self.clock,
-            "AT+CSCS=\"UCS2\"",
-            Duration::from_secs(3),
+            &cpms_cmd,
+            Duration::from_secs(5),
             &mut self.at_state,
-        )?;
+        )
+        .context(format!(
+            "failed to set SMS storage to {} (AT+CPMS)",
+            storage_str
+        ))?;
+
+        // 7. AT+CNMI=2,1,0,0,0 - new SMS indications
         send_command(
             &mut self.port,
             &self.clock,
             "AT+CNMI=2,1,0,0,0",
             Duration::from_secs(3),
             &mut self.at_state,
-        )?;
+        )
+        .context("failed to configure new SMS indications (AT+CNMI)")?;
+
+        Ok(())
+    }
+
+    /// Send AT commands until we get OK response (modem sync)
+    fn at_sync(&mut self) -> Result<()> {
+        const MAX_RETRIES: usize = 10;
+        const RETRY_DELAY: Duration = Duration::from_millis(500);
+
+        for attempt in 1..=MAX_RETRIES {
+            log::debug!("AT sync attempt {}/{}", attempt, MAX_RETRIES);
+            match send_command(
+                &mut self.port,
+                &self.clock,
+                "AT",
+                Duration::from_secs(2),
+                &mut self.at_state,
+            ) {
+                Ok(_) => {
+                    log::info!("Modem responded to AT sync on attempt {}", attempt);
+                    return Ok(());
+                }
+                Err(e) => {
+                    log::debug!("AT sync attempt {} failed: {}", attempt, e);
+                    if attempt < MAX_RETRIES {
+                        self.clock.sleep(RETRY_DELAY);
+                    }
+                }
+            }
+        }
+        anyhow::bail!("modem did not respond to AT after {} attempts", MAX_RETRIES);
+    }
+
+    /// Wait for network registration (CREG and CEREG) with bounded wait
+    fn wait_for_network_registration(&mut self) -> Result<()> {
+        const MAX_WAIT: Duration = Duration::from_secs(30);
+        const POLL_INTERVAL: Duration = Duration::from_secs(2);
+        let deadline = self.clock.now() + MAX_WAIT;
+
+        log::info!("Waiting for network registration...");
+
+        while self.clock.now() < deadline {
+            // Check CREG (2G/3G)
+            if let Ok(lines) = send_command(
+                &mut self.port,
+                &self.clock,
+                "AT+CREG?",
+                Duration::from_secs(3),
+                &mut self.at_state,
+            ) {
+                if let Some(status) = parse_creg_response(&lines) {
+                    if status == 1 || status == 5 {
+                        log::info!("Network registered (CREG: {})", status);
+                        return Ok(());
+                    }
+                }
+            }
+
+            // Check CEREG (LTE)
+            if let Ok(lines) = send_command(
+                &mut self.port,
+                &self.clock,
+                "AT+CEREG?",
+                Duration::from_secs(3),
+                &mut self.at_state,
+            ) {
+                if let Some(status) = parse_cereg_response(&lines) {
+                    if status == 1 || status == 5 {
+                        log::info!("Network registered (CEREG: {})", status);
+                        return Ok(());
+                    }
+                }
+            }
+
+            log::debug!("Network not yet registered, waiting...");
+            self.clock.sleep(POLL_INTERVAL);
+        }
+
+        log::warn!(
+            "Network registration timeout after {}s, continuing anyway",
+            MAX_WAIT.as_secs()
+        );
         Ok(())
     }
 
@@ -71,7 +236,7 @@ impl<P: AtPortRaw, C: Clock> SmsService<P, C> {
         let lines = send_command(
             &mut self.port,
             &self.clock,
-            &format!("AT+CMGR={index}"),
+            &format!("AT+CMGR={}", index),
             Duration::from_secs(5),
             &mut self.at_state,
         )?;
@@ -87,7 +252,7 @@ impl<P: AtPortRaw, C: Clock> SmsService<P, C> {
         send_command(
             &mut self.port,
             &self.clock,
-            &format!("AT+CMGD={index}"),
+            &format!("AT+CMGD={}", index),
             Duration::from_secs(3),
             &mut self.at_state,
         )?;
@@ -154,6 +319,36 @@ impl<P: AtPortRaw, C: Clock> SmsService<P, C> {
     }
 }
 
+fn parse_creg_response(lines: &[String]) -> Option<u8> {
+    for line in lines {
+        if line.starts_with("+CREG:") {
+            // Format: +CREG: <n>,<stat>[,<lac>,<ci>[,<AcT>]]
+            let parts: Vec<&str> = line.split(',').collect();
+            if parts.len() >= 2 {
+                if let Ok(stat) = parts[1].trim().parse::<u8>() {
+                    return Some(stat);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn parse_cereg_response(lines: &[String]) -> Option<u8> {
+    for line in lines {
+        if line.starts_with("+CEREG:") {
+            // Format: +CEREG: <n>,<stat>[,<tac>,<ci>[,<AcT>]]
+            let parts: Vec<&str> = line.split(',').collect();
+            if parts.len() >= 2 {
+                if let Ok(stat) = parts[1].trim().parse::<u8>() {
+                    return Some(stat);
+                }
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,6 +368,14 @@ mod tests {
         read_queue: Mutex<VecDeque<Vec<u8>>>,
         /// Record of CMGD commands sent
         deleted_indices: Mutex<Vec<u16>>,
+        /// Record of commands written (for verification)
+        written_commands: Mutex<Vec<String>>,
+        /// Whether to simulate CPIN not ready
+        cpin_not_ready: Mutex<bool>,
+        /// Whether to simulate CMGF error
+        cmgf_error: Mutex<bool>,
+        /// AT sync failure count (for testing retries)
+        at_sync_failures: Mutex<usize>,
     }
 
     impl MockRawPort {
@@ -181,6 +384,10 @@ mod tests {
                 cmgr_responses: Mutex::new(VecDeque::new()),
                 read_queue: Mutex::new(VecDeque::new()),
                 deleted_indices: Mutex::new(Vec::new()),
+                written_commands: Mutex::new(Vec::new()),
+                cpin_not_ready: Mutex::new(false),
+                cmgf_error: Mutex::new(false),
+                at_sync_failures: Mutex::new(0),
             }
         }
 
@@ -201,12 +408,32 @@ mod tests {
         fn get_deleted(&self) -> Vec<u16> {
             self.deleted_indices.lock().unwrap().clone()
         }
+
+        /// Get written commands for verification
+        fn get_written_commands(&self) -> Vec<String> {
+            self.written_commands.lock().unwrap().clone()
+        }
+
+        /// Set CPIN not ready for testing
+        fn set_cpin_not_ready(&self, val: bool) {
+            *self.cpin_not_ready.lock().unwrap() = val;
+        }
+
+        /// Set CMGF error for testing
+        fn set_cmgf_error(&self, val: bool) {
+            *self.cmgf_error.lock().unwrap() = val;
+        }
+
+        /// Set AT sync failures for testing retries
+        fn set_at_sync_failures(&self, count: usize) {
+            *self.at_sync_failures.lock().unwrap() = count;
+        }
     }
 
     impl AtPortRaw for MockRawPort {
         fn write_raw(&mut self, data: &[u8]) -> Result<()> {
-            // Parse the command to determine what response to queue
             let cmd = String::from_utf8_lossy(data).trim().to_string();
+            self.written_commands.lock().unwrap().push(cmd.clone());
 
             if cmd.starts_with("AT+CMGR=") {
                 let mut responses = self.cmgr_responses.lock().unwrap();
@@ -225,8 +452,44 @@ mod tests {
                 self.push_read(b"OK\r\n".to_vec());
                 return Ok(());
             }
-            // For init commands, return OK
-            self.push_read(b"OK\r\n".to_vec());
+
+            // For init commands, provide appropriate responses
+            let response = if cmd == "AT" {
+                // Handle AT sync retries
+                let mut failures = self.at_sync_failures.lock().unwrap();
+                if *failures > 0 {
+                    *failures -= 1;
+                    // Return timeout/error to trigger retry
+                    b"".to_vec() // No response -> timeout
+                } else {
+                    b"OK\r\n".to_vec()
+                }
+            } else if cmd == "ATE0" {
+                b"OK\r\n".to_vec()
+            } else if cmd == "AT+CPIN?" {
+                if *self.cpin_not_ready.lock().unwrap() {
+                    b"\r\n+CPIN: SIM PIN\r\n\r\nOK\r\n".to_vec()
+                } else {
+                    b"\r\n+CPIN: READY\r\n\r\nOK\r\n".to_vec()
+                }
+            } else if cmd == "AT+CREG?" {
+                b"\r\n+CREG: 0,1\r\n\r\nOK\r\n".to_vec()
+            } else if cmd == "AT+CEREG?" {
+                b"\r\n+CEREG: 0,1\r\n\r\nOK\r\n".to_vec()
+            } else if cmd == "AT+CMGF=0" {
+                if *self.cmgf_error.lock().unwrap() {
+                    b"ERROR\r\n".to_vec()
+                } else {
+                    b"OK\r\n".to_vec()
+                }
+            } else if cmd.starts_with("AT+CPMS=") {
+                b"\r\n+CPMS: 10,50,10,50,10,50\r\n\r\nOK\r\n".to_vec()
+            } else if cmd == "AT+CNMI=2,1,0,0,0" {
+                b"OK\r\n".to_vec()
+            } else {
+                b"OK\r\n".to_vec()
+            };
+            self.push_read(response);
             Ok(())
         }
 
@@ -256,6 +519,125 @@ mod tests {
     }
 
     #[test]
+    fn test_init_command_order() {
+        let port = MockRawPort::new();
+        let clock = MockClock::new(Instant::now());
+        let mut service = SmsService::with_clock_and_storage(port, clock, SmsStorage::SM);
+
+        service.init().unwrap();
+
+        let commands = service.port.get_written_commands();
+        // Verify exact command order
+        assert_eq!(commands[0], "AT"); // AT sync
+        assert_eq!(commands[1], "ATE0"); // Echo off
+        assert_eq!(commands[2], "AT+CPIN?"); // PIN status
+                                             // CREG/CEREG checks may appear multiple times during wait
+                                             // Find CMGF=0
+        let cmgf_idx = commands
+            .iter()
+            .position(|c| c == "AT+CMGF=0")
+            .expect("CMGF=0 not found");
+        // CPMS should be after CMGF
+        let cpms_idx = commands
+            .iter()
+            .position(|c| c.starts_with("AT+CPMS="))
+            .expect("CPMS not found");
+        assert!(cpms_idx > cmgf_idx, "CPMS should come after CMGF=0");
+        // CNMI should be after CPMS
+        let cnmi_idx = commands
+            .iter()
+            .position(|c| c == "AT+CNMI=2,1,0,0,0")
+            .expect("CNMI not found");
+        assert!(cnmi_idx > cpms_idx, "CNMI should come after CPMS");
+
+        // Verify CPMS uses SM storage
+        let cpms_cmd = &commands[cpms_idx];
+        assert!(
+            cpms_cmd.contains("\"SM\""),
+            "CPMS should use SM storage: {}",
+            cpms_cmd
+        );
+        assert!(
+            !commands.iter().any(|c| c == "AT+CSCS=\"UCS2\""),
+            "CSCS=UCS2 should not be sent"
+        );
+    }
+
+    #[test]
+    fn test_init_storage_me() {
+        let port = MockRawPort::new();
+        let clock = MockClock::new(Instant::now());
+        let mut service = SmsService::with_clock_and_storage(port, clock, SmsStorage::ME);
+
+        service.init().unwrap();
+
+        let commands = service.port.get_written_commands();
+        let cpms_idx = commands
+            .iter()
+            .position(|c| c.starts_with("AT+CPMS="))
+            .expect("CPMS not found");
+        let cpms_cmd = &commands[cpms_idx];
+        assert!(
+            cpms_cmd.contains("\"ME\""),
+            "CPMS should use ME storage: {}",
+            cpms_cmd
+        );
+    }
+
+    #[test]
+    fn test_init_cpin_not_ready() {
+        let port = MockRawPort::new();
+        port.set_cpin_not_ready(true);
+        let clock = MockClock::new(Instant::now());
+        let mut service = SmsService::with_clock_and_storage(port, clock, SmsStorage::SM);
+
+        let result = service.init();
+        assert!(result.is_err(), "init should fail when CPIN not ready");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("SIM not ready"),
+            "Error should mention SIM not ready: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_init_cmgf_error() {
+        let port = MockRawPort::new();
+        port.set_cmgf_error(true);
+        let clock = MockClock::new(Instant::now());
+        let mut service = SmsService::with_clock_and_storage(port, clock, SmsStorage::SM);
+
+        let result = service.init();
+        assert!(result.is_err(), "init should fail when CMGF returns ERROR");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("PDU mode"),
+            "Error should mention PDU mode: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_at_sync_retries() {
+        let port = MockRawPort::new();
+        // Fail first 3 AT attempts, then succeed
+        port.set_at_sync_failures(3);
+        let clock = MockClock::new(Instant::now());
+        let mut service = SmsService::with_clock_and_storage(port, clock, SmsStorage::SM);
+
+        service.init().unwrap();
+
+        let commands = service.port.get_written_commands();
+        // Should have 4 AT commands (3 failures + 1 success)
+        let at_count = commands.iter().filter(|c| *c == "AT").count();
+        assert_eq!(
+            at_count, 4,
+            "AT sync should be attempted 4 times (3 retries + success)"
+        );
+    }
+
+    #[test]
     fn test_multipart_three_parts_completes_and_deletes() {
         // Use GSM7_10_P1, P2, P3 at indices 4, 5, 6
         let p1_pdu = GSM7_10_P1.0;
@@ -275,13 +657,15 @@ mod tests {
         port.push_read(b"\r\n+CMTI: \"SM\",6\r\n".to_vec());
 
         let clock = MockClock::new(Instant::now());
-        let mut service = SmsService::with_clock(port, clock);
+        let mut service = SmsService::with_clock_and_storage(port, clock, SmsStorage::SM);
 
         let received = Arc::new(Mutex::new(Vec::new()));
         let received_clone = received.clone();
         service.on_sms(move |sms| {
             received_clone.lock().unwrap().push(sms.message);
         });
+
+        service.init().unwrap();
 
         // Poll for all three parts
         service.poll(Duration::from_millis(100)).unwrap();
@@ -312,13 +696,15 @@ mod tests {
 
         let start = Instant::now();
         let clock = MockClock::new(start);
-        let mut service = SmsService::with_clock(port, clock.clone());
+        let mut service = SmsService::with_clock_and_storage(port, clock.clone(), SmsStorage::SM);
 
         let received = Arc::new(Mutex::new(Vec::new()));
         let received_clone = received.clone();
         service.on_sms(move |sms| {
             received_clone.lock().unwrap().push(sms.message);
         });
+
+        service.init().unwrap();
 
         // Poll for the first part
         service.poll(Duration::from_millis(100)).unwrap();
@@ -352,13 +738,15 @@ mod tests {
         port.push_read(b"\r\n+CMTI: \"SM\",7\r\n".to_vec());
 
         let clock = MockClock::new(Instant::now());
-        let mut service = SmsService::with_clock(port, clock);
+        let mut service = SmsService::with_clock_and_storage(port, clock, SmsStorage::SM);
 
         let received = Arc::new(Mutex::new(Vec::new()));
         let received_clone = received.clone();
         service.on_sms(move |sms| {
             received_clone.lock().unwrap().push(sms.message);
         });
+
+        service.init().unwrap();
 
         // Poll for the message
         service.poll(Duration::from_millis(100)).unwrap();
