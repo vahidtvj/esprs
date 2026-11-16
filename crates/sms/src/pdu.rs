@@ -354,3 +354,17 @@ pub fn parse_pdu_response(lines: &[String]) -> Result<Sms> {
 
     parse_pdu(pdu_hex)
 }
+
+pub fn parse_pdu_with_udh_response(lines: &[String]) -> Result<ParseResult> {
+    let cmgr_pos = lines
+        .iter()
+        .position(|l| l.contains("+CMGR:"))
+        .ok_or_else(|| anyhow::anyhow!("No +CMGR header found"))?;
+
+    let pdu_hex = lines
+        .get(cmgr_pos + 1)
+        .ok_or_else(|| anyhow::anyhow!("No PDU line found"))?
+        .trim();
+
+    parse_pdu_with_udh(pdu_hex)
+}

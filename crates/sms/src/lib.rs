@@ -24,9 +24,9 @@ pub struct ParseResult {
     pub concat: Option<Concat>,
 }
 
-pub use pdu::{parse_pdu, parse_pdu_response, parse_pdu_with_udh};
+pub use pdu::{parse_pdu, parse_pdu_response, parse_pdu_with_udh, parse_pdu_with_udh_response};
 pub use reassembler::{CompletedMessage, Reassembler, ReassemblerConfig};
-pub use service::{AtPort, SmsService};
+pub use service::{AtPort, Clock, SmsService, SystemClock};
 
 #[cfg(test)]
 mod test_vectors;
