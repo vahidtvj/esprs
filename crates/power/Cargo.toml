@@ -6,8 +6,4 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0"
 log = "0.4"
-esp-idf-svc = { version = "0.53", features = [
-    "critical-section",
-    "embassy-time-driver",
-    "embassy-sync",
-] }
+esp-idf-svc = "0.53"

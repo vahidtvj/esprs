@@ -3,9 +3,7 @@ use esp_idf_svc::hal::delay::TickType;
 use esp_idf_svc::hal::peripherals::Peripherals;
 use esp_idf_svc::hal::uart::*;
 use power::{PowerControl, SimcomPower};
-use sms::{AtPortRaw, Sms, SmsService};
-use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use sms::{send_command, AtError, AtPortRaw, AtState, SmsService, SystemClock};
 use std::time::Duration;
 
 mod pinout;
@@ -73,7 +71,6 @@ fn main() -> Result<()> {
         peripherals.pins.gpio5.into(),
         peripherals.pins.gpio4.into(),
     )?;
-    pwr.power_on()?;
 
     let config = config::Config::new().baudrate(esp_idf_svc::hal::units::Hertz(MODEM_BAUDRATE));
     let uart = UartDriver::new(
@@ -85,18 +82,33 @@ fn main() -> Result<()> {
         &config,
     )?;
 
-    let (tx, rx): (Sender<Sms>, Receiver<Sms>) = channel();
-    let tx = Arc::new(Mutex::new(tx));
+    let mut at_port = UartAtPort::new(uart);
+    let mut at_state = AtState::new();
+    let clock = SystemClock;
+    match send_command(
+        &mut at_port,
+        &clock,
+        "AT",
+        Duration::from_secs(2),
+        &mut at_state,
+    ) {
+        Ok(_) => log::info!("Modem is already powered and responded to AT"),
+        Err(error) if matches!(error.downcast_ref::<AtError>(), Some(AtError::Timeout)) => {
+            log::info!("Modem did not respond to AT; powering it on");
+            pwr.power_on()?;
+        }
+        Err(error) => return Err(error.context("failed to query modem with AT")),
+    }
 
-    let at_port = UartAtPort::new(uart);
     let mut sms_service = SmsService::new(at_port);
 
-    let tx_clone = tx.clone();
-    sms_service.on_sms(move |sms| {
+    sms_service.on_sms(|sms| {
         log::debug!(target: "esprs", "on_sms callback triggered for: {}", sms.sender);
-        if let Ok(tx) = tx_clone.lock() {
-            let _ = tx.send(sms);
-        }
+        let encoded = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            sms.message.as_bytes(),
+        );
+        log::info!("Received SMS from {}: [base64] {}", sms.sender, encoded);
     });
 
     sms_service.init()?;
@@ -104,13 +116,8 @@ fn main() -> Result<()> {
     log::info!("SMS service initialized, listening for incoming SMS...");
 
     loop {
-        sms_service.poll(Duration::from_millis(100))?;
-        if let Ok(sms) = rx.try_recv() {
-            let encoded = base64::Engine::encode(
-                &base64::engine::general_purpose::STANDARD,
-                sms.message.as_bytes(),
-            );
-            log::info!("Received SMS from {}: [base64] {}", sms.sender, encoded);
+        if let Err(error) = sms_service.poll(Duration::from_millis(100)) {
+            log::warn!(target: "esprs", "Transient SMS poll error: {:#}", error);
         }
     }
 }
