@@ -29,7 +29,11 @@ impl<'d> AtPortRaw for UartAtPort<'d> {
     fn read_raw(&mut self, buf: &mut [u8], timeout: Duration) -> Result<usize> {
         // Convert Duration to FreeRTOS ticks
         let ticks = TickType::new_millis(timeout.as_millis() as u64).ticks();
-        let len = self.driver.read(buf, ticks)?;
+        let len = match self.driver.read(buf, ticks) {
+            Ok(len) => len,
+            Err(error) if error.code() == esp_idf_svc::sys::ESP_ERR_TIMEOUT => return Ok(0),
+            Err(error) => return Err(error.into()),
+        };
         if len > 0 {
             log::debug!(target: "uart", "<< (raw) {}", String::from_utf8_lossy(&buf[..len]).trim());
         }
