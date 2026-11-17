@@ -28,8 +28,9 @@ pub const BOARD_BAT_ADC_PIN: i32 = 35;
 
 /// Timing constants for modem power sequence (milliseconds)
 pub const MODEM_POWER_ON_DELAY_MS: u32 = 100;
-pub const MODEM_PWRKEY_PULSE_MS: u32 = 600;
-pub const MODEM_BOOT_DELAY_MS: u32 = 2000;
+pub const MODEM_PWRKEY_PULSE_MS: u32 = 100;
+pub const MODEM_POWEROFF_PULSE_MS: u32 = 3000;
+pub const MODEM_BOOT_DELAY_MS: u32 = 3000;
 pub const MODEM_RESET_PULSE_MS: u32 = 100;
 
 /// Reset level for normal operation (HIGH = not in reset, active LOW reset)
