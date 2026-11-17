@@ -90,7 +90,6 @@ fn main() -> Result<()> {
 
     let at_port = UartAtPort::new(uart);
     let mut sms_service = SmsService::new(at_port);
-    sms_service.init()?;
 
     let tx_clone = tx.clone();
     sms_service.on_sms(move |sms| {
@@ -99,6 +98,8 @@ fn main() -> Result<()> {
             let _ = tx.send(sms);
         }
     });
+
+    sms_service.init()?;
 
     log::info!("SMS service initialized, listening for incoming SMS...");
 

@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::at_port::{poll_urcs, send_command, AtPortRaw, AtState, Clock, SystemClock};
 use crate::reassembler::{CompletedMessage, Reassembler, ReassemblerConfig};
@@ -38,6 +38,10 @@ pub struct SmsService<P: AtPortRaw, C: Clock> {
     at_state: AtState,
     /// SMS storage location (ME or SM)
     storage: SmsStorage,
+    /// Interval between stored-message sweeps.
+    sweep_interval: Duration,
+    /// Time of the last stored-message sweep.
+    last_sweep: Option<Instant>,
 }
 
 impl<P: AtPortRaw> SmsService<P, SystemClock> {
@@ -63,6 +67,8 @@ impl<P: AtPortRaw, C: Clock> SmsService<P, C> {
             clock,
             at_state: AtState::new(),
             storage,
+            sweep_interval: Duration::from_secs(60),
+            last_sweep: None,
         }
     }
 
@@ -74,7 +80,31 @@ impl<P: AtPortRaw, C: Clock> SmsService<P, C> {
             clock,
             at_state: AtState::new(),
             storage: SmsStorage::default(),
+            sweep_interval: Duration::from_secs(60),
+            last_sweep: None,
         }
+    }
+
+    /// Construct a service with a custom stored-message sweep interval.
+    pub fn with_sweep_interval(port: P, clock: C, sweep_interval: Duration) -> Self {
+        Self::with_clock_and_sweep_interval(port, clock, sweep_interval)
+    }
+
+    /// Construct a service with a custom clock and stored-message sweep interval.
+    pub fn with_clock_and_sweep_interval(port: P, clock: C, sweep_interval: Duration) -> Self {
+        let mut service = Self::with_clock(port, clock);
+        service.sweep_interval = sweep_interval;
+        service
+    }
+
+    /// Set the stored-message sweep interval.
+    pub fn set_sweep_interval(&mut self, sweep_interval: Duration) {
+        self.sweep_interval = sweep_interval;
+    }
+
+    /// Return the stored-message sweep interval.
+    pub fn sweep_interval(&self) -> Duration {
+        self.sweep_interval
     }
 
     /// Initialize the modem for SMS operation
@@ -147,6 +177,8 @@ impl<P: AtPortRaw, C: Clock> SmsService<P, C> {
         )
         .context("failed to configure new SMS indications (AT+CNMI)")?;
 
+        // Sweep messages already in storage once initialization is complete.
+        self.sweep_stored_messages();
         Ok(())
     }
 
@@ -233,14 +265,18 @@ impl<P: AtPortRaw, C: Clock> SmsService<P, C> {
 
     /// Read SMS and return full ParseResult including concat info
     pub fn read_with_concat(&mut self, index: u16) -> Result<ParseResult> {
-        let lines = send_command(
+        let lines = self.read_response(index)?;
+        crate::pdu::parse_pdu_with_udh_response(&lines)
+    }
+
+    fn read_response(&mut self, index: u16) -> Result<Vec<String>> {
+        send_command(
             &mut self.port,
             &self.clock,
             &format!("AT+CMGR={}", index),
             Duration::from_secs(5),
             &mut self.at_state,
-        )?;
-        crate::pdu::parse_pdu_with_udh_response(&lines)
+        )
     }
 
     /// Read SMS (backward compatible - returns only Sms)
@@ -259,6 +295,12 @@ impl<P: AtPortRaw, C: Clock> SmsService<P, C> {
         Ok(())
     }
 
+    fn delete_logged(&mut self, index: u16) {
+        if let Err(error) = self.delete(index) {
+            log::error!("Failed to delete SMS at index {}: {}", index, error);
+        }
+    }
+
     pub fn on_sms<F>(&mut self, cb: F)
     where
         F: FnMut(Sms) + Send + 'static,
@@ -272,26 +314,7 @@ impl<P: AtPortRaw, C: Clock> SmsService<P, C> {
         // Check for new incoming SMS
         if let Some(index) = poll_urcs(&mut self.port, &self.clock, &mut self.at_state, timeout)? {
             log::info!("Incoming SMS notification at index {}, reading...", index);
-            match self.read_with_concat(index) {
-                Ok(parse_result) => {
-                    log::info!(
-                        "Successfully read SMS from {}, feeding to reassembler...",
-                        parse_result.sms.sender
-                    );
-                    let completed = self.reassembler.feed(
-                        index,
-                        &parse_result.sms.sender,
-                        &parse_result.sms.date,
-                        &parse_result.sms.message,
-                        parse_result.concat.as_ref(),
-                        now,
-                    );
-                    self.handle_completed(completed)?;
-                }
-                Err(e) => {
-                    log::error!("Failed to read SMS at index {}: {}", index, e);
-                }
-            }
+            self.process_message(index, now);
         }
 
         // Expire old incomplete groups
@@ -300,6 +323,15 @@ impl<P: AtPortRaw, C: Clock> SmsService<P, C> {
             log::info!("Expired {} incomplete SMS group(s)", expired.len());
         }
         self.handle_completed(expired)?;
+
+        // Periodically recover messages for which a +CMTI indication was missed.
+        if self
+            .last_sweep
+            .map(|last| now.duration_since(last) >= self.sweep_interval)
+            .unwrap_or(false)
+        {
+            self.sweep_stored_messages();
+        }
 
         Ok(())
     }
@@ -310,13 +342,185 @@ impl<P: AtPortRaw, C: Clock> SmsService<P, C> {
             if let Some(ref mut cb) = self.callback {
                 cb(msg.sms);
             }
-            // Delete all indices for this group
+            // Delete all indices for this group. A failed delete must not stop
+            // processing of the remaining messages.
             for index in msg.indices {
-                let _ = self.delete(index);
+                self.delete_logged(index);
             }
         }
         Ok(())
     }
+
+    fn process_message(&mut self, index: u16, now: Instant) {
+        let lines = match self.read_response(index) {
+            Ok(lines) => lines,
+            Err(error) => {
+                log::error!("Failed to read SMS at index {}: {}", index, error);
+                self.delete_logged(index);
+                return;
+            }
+        };
+
+        let raw_pdu = extract_pdu(&lines).unwrap_or_else(|| "<missing>".to_string());
+        if is_non_deliver_pdu(&raw_pdu) {
+            log::info!("Deleting non-DELIVER SMS at index {}", index);
+            self.delete_logged(index);
+            return;
+        }
+        let parsed = crate::pdu::parse_pdu_with_udh(&raw_pdu);
+        let parse_result = match parsed {
+            Ok(result) => result,
+            Err(error) => {
+                log::error!(
+                    "Failed to parse SMS at index {} (raw PDU: {}): {}",
+                    index,
+                    raw_pdu,
+                    error
+                );
+                self.delete_logged(index);
+                return;
+            }
+        };
+
+        log::info!(
+            "Successfully read SMS from {}, feeding to reassembler...",
+            parse_result.sms.sender
+        );
+        let completed = self.reassembler.feed(
+            index,
+            &parse_result.sms.sender,
+            &parse_result.sms.date,
+            &parse_result.sms.message,
+            parse_result.concat.as_ref(),
+            now,
+        );
+        let _ = self.handle_completed(completed);
+    }
+
+    /// List and process all messages currently in the selected SMS store.
+    fn sweep_stored_messages(&mut self) {
+        let now = self.clock.now();
+        self.last_sweep = Some(now);
+
+        let lines = match send_command(
+            &mut self.port,
+            &self.clock,
+            "AT+CMGL=4",
+            Duration::from_secs(5),
+            &mut self.at_state,
+        ) {
+            Ok(lines) => lines,
+            Err(error) => {
+                log::error!("Failed to sweep stored SMS messages (AT+CMGL=4): {}", error);
+                return;
+            }
+        };
+
+        for (index, raw_pdu) in parse_cmg_l_messages(&lines) {
+            log::info!("Sweeping stored SMS at index {}, processing...", index);
+            match raw_pdu {
+                Some(raw_pdu) => self.process_swept_message(index, &raw_pdu, now),
+                None => {
+                    log::error!("Missing PDU for swept SMS at index {}", index);
+                    self.delete_logged(index);
+                }
+            }
+        }
+    }
+
+    fn process_swept_message(&mut self, index: u16, raw_pdu: &str, now: Instant) {
+        if is_non_deliver_pdu(raw_pdu) {
+            log::info!("Deleting non-DELIVER swept SMS at index {}", index);
+            self.delete_logged(index);
+            return;
+        }
+        let parsed = crate::pdu::parse_pdu_with_udh(raw_pdu);
+        let parse_result = match parsed {
+            Ok(result) => result,
+            Err(error) => {
+                log::error!(
+                    "Failed to parse swept SMS at index {} (raw PDU: {}): {}",
+                    index,
+                    raw_pdu,
+                    error
+                );
+                self.delete_logged(index);
+                return;
+            }
+        };
+
+        let completed = self.reassembler.feed(
+            index,
+            &parse_result.sms.sender,
+            &parse_result.sms.date,
+            &parse_result.sms.message,
+            parse_result.concat.as_ref(),
+            now,
+        );
+        let _ = self.handle_completed(completed);
+    }
+}
+
+fn extract_pdu(lines: &[String]) -> Option<String> {
+    let position = lines
+        .iter()
+        .position(|line| line.contains("+CMGR:") || line.contains("+CMGL:"))
+        .or_else(|| lines.iter().position(|line| !line.trim().is_empty()))?;
+    lines.get(position + 1).map(|pdu| pdu.trim().to_string())
+}
+
+fn is_non_deliver_pdu(raw_pdu: &str) -> bool {
+    let Ok(bytes) = crate::pdu::hex_to_bytes(raw_pdu) else {
+        return false;
+    };
+    if bytes.is_empty() {
+        return false;
+    }
+    let smsc_len = bytes[0] as usize;
+    let tp_index = 1 + smsc_len;
+    bytes
+        .get(tp_index)
+        .map(|first_octet| first_octet & 0x03 != 0)
+        .unwrap_or(false)
+}
+
+/// Parse the `+CMGL: <index>,<stat>,<alpha>,<length>` records and their PDU lines.
+/// The A7670 emits both `,,` and `,"",` for an empty alpha field.
+fn parse_cmg_l_messages(lines: &[String]) -> Vec<(u16, Option<String>)> {
+    let mut messages = Vec::new();
+    let mut position = 0;
+    while position < lines.len() {
+        let line = lines[position].trim();
+        if !line.starts_with("+CMGL:") {
+            position += 1;
+            continue;
+        }
+
+        let header = line.trim_start_matches("+CMGL:").trim();
+        let mut fields = header.splitn(4, ',');
+        let index = fields
+            .next()
+            .and_then(|value| value.trim().parse::<u16>().ok());
+        let _stat = fields.next();
+        let _alpha = fields.next().unwrap_or("");
+        let _length = fields.next().unwrap_or("");
+
+        if index.is_none() {
+            log::warn!("Ignoring malformed +CMGL header: {}", line);
+            position += 1;
+            continue;
+        }
+
+        if let Some(raw_pdu) = lines.get(position + 1) {
+            messages.push((index.unwrap(), Some(raw_pdu.trim().to_string())));
+            position += 2;
+        } else {
+            log::warn!("Missing PDU after +CMGL header: {}", line);
+            messages.push((index.unwrap(), None));
+            position += 1;
+        }
+    }
+    messages
 }
 
 fn parse_creg_response(lines: &[String]) -> Option<u8> {
@@ -350,414 +554,4 @@ fn parse_cereg_response(lines: &[String]) -> Option<u8> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::at_port::{AtPortRaw, MockClock};
-    use crate::test_vectors::concat_cases::*;
-    use crate::test_vectors::ok_cases::GSM7_HI;
-    use crate::Sms;
-    use std::collections::VecDeque;
-    use std::sync::{Arc, Mutex};
-    use std::time::{Duration, Instant};
-
-    /// Mock raw port for testing SmsService
-    struct MockRawPort {
-        /// Queue of (index, PDU response lines) for CMGR reads
-        cmgr_responses: Mutex<VecDeque<(u16, Vec<String>)>>,
-        /// Queue of raw byte chunks to return on read
-        read_queue: Mutex<VecDeque<Vec<u8>>>,
-        /// Record of CMGD commands sent
-        deleted_indices: Mutex<Vec<u16>>,
-        /// Record of commands written (for verification)
-        written_commands: Mutex<Vec<String>>,
-        /// Whether to simulate CPIN not ready
-        cpin_not_ready: Mutex<bool>,
-        /// Whether to simulate CMGF error
-        cmgf_error: Mutex<bool>,
-        /// AT sync failure count (for testing retries)
-        at_sync_failures: Mutex<usize>,
-    }
-
-    impl MockRawPort {
-        fn new() -> Self {
-            Self {
-                cmgr_responses: Mutex::new(VecDeque::new()),
-                read_queue: Mutex::new(VecDeque::new()),
-                deleted_indices: Mutex::new(Vec::new()),
-                written_commands: Mutex::new(Vec::new()),
-                cpin_not_ready: Mutex::new(false),
-                cmgf_error: Mutex::new(false),
-                at_sync_failures: Mutex::new(0),
-            }
-        }
-
-        /// Add a CMGR response for a specific index (as raw bytes)
-        fn add_cmgr_response(&self, index: u16, lines: Vec<String>) {
-            self.cmgr_responses
-                .lock()
-                .unwrap()
-                .push_back((index, lines));
-        }
-
-        /// Add raw bytes to the read queue
-        fn push_read(&self, data: Vec<u8>) {
-            self.read_queue.lock().unwrap().push_back(data);
-        }
-
-        /// Get deleted indices
-        fn get_deleted(&self) -> Vec<u16> {
-            self.deleted_indices.lock().unwrap().clone()
-        }
-
-        /// Get written commands for verification
-        fn get_written_commands(&self) -> Vec<String> {
-            self.written_commands.lock().unwrap().clone()
-        }
-
-        /// Set CPIN not ready for testing
-        fn set_cpin_not_ready(&self, val: bool) {
-            *self.cpin_not_ready.lock().unwrap() = val;
-        }
-
-        /// Set CMGF error for testing
-        fn set_cmgf_error(&self, val: bool) {
-            *self.cmgf_error.lock().unwrap() = val;
-        }
-
-        /// Set AT sync failures for testing retries
-        fn set_at_sync_failures(&self, count: usize) {
-            *self.at_sync_failures.lock().unwrap() = count;
-        }
-    }
-
-    impl AtPortRaw for MockRawPort {
-        fn write_raw(&mut self, data: &[u8]) -> Result<()> {
-            let cmd = String::from_utf8_lossy(data).trim().to_string();
-            self.written_commands.lock().unwrap().push(cmd.clone());
-
-            if cmd.starts_with("AT+CMGR=") {
-                let mut responses = self.cmgr_responses.lock().unwrap();
-                if let Some((idx, lines)) = responses.pop_front() {
-                    let expected_idx = cmd["AT+CMGR=".len()..].parse::<u16>().unwrap();
-                    assert_eq!(idx, expected_idx, "CMGR index mismatch");
-                    // Queue the response as raw bytes
-                    let response = lines.join("\r\n") + "\r\n";
-                    self.push_read(response.into_bytes());
-                    return Ok(());
-                }
-                anyhow::bail!("No CMGR response queued for index");
-            } else if cmd.starts_with("AT+CMGD=") {
-                let idx = cmd["AT+CMGD=".len()..].parse::<u16>().unwrap();
-                self.deleted_indices.lock().unwrap().push(idx);
-                self.push_read(b"OK\r\n".to_vec());
-                return Ok(());
-            }
-
-            // For init commands, provide appropriate responses
-            let response = if cmd == "AT" {
-                // Handle AT sync retries
-                let mut failures = self.at_sync_failures.lock().unwrap();
-                if *failures > 0 {
-                    *failures -= 1;
-                    // Return timeout/error to trigger retry
-                    b"".to_vec() // No response -> timeout
-                } else {
-                    b"OK\r\n".to_vec()
-                }
-            } else if cmd == "ATE0" {
-                b"OK\r\n".to_vec()
-            } else if cmd == "AT+CPIN?" {
-                if *self.cpin_not_ready.lock().unwrap() {
-                    b"\r\n+CPIN: SIM PIN\r\n\r\nOK\r\n".to_vec()
-                } else {
-                    b"\r\n+CPIN: READY\r\n\r\nOK\r\n".to_vec()
-                }
-            } else if cmd == "AT+CREG?" {
-                b"\r\n+CREG: 0,1\r\n\r\nOK\r\n".to_vec()
-            } else if cmd == "AT+CEREG?" {
-                b"\r\n+CEREG: 0,1\r\n\r\nOK\r\n".to_vec()
-            } else if cmd == "AT+CMGF=0" {
-                if *self.cmgf_error.lock().unwrap() {
-                    b"ERROR\r\n".to_vec()
-                } else {
-                    b"OK\r\n".to_vec()
-                }
-            } else if cmd.starts_with("AT+CPMS=") {
-                b"\r\n+CPMS: 10,50,10,50,10,50\r\n\r\nOK\r\n".to_vec()
-            } else if cmd == "AT+CNMI=2,1,0,0,0" {
-                b"OK\r\n".to_vec()
-            } else {
-                b"OK\r\n".to_vec()
-            };
-            self.push_read(response);
-            Ok(())
-        }
-
-        fn read_raw(&mut self, buf: &mut [u8], _timeout: Duration) -> Result<usize> {
-            let mut queue = self.read_queue.lock().unwrap();
-            if queue.is_empty() {
-                return Ok(0);
-            }
-            let data = queue.pop_front().unwrap();
-            let len = data.len().min(buf.len());
-            buf[..len].copy_from_slice(&data[..len]);
-            if data.len() > len {
-                queue.push_front(data[len..].to_vec());
-            }
-            Ok(len)
-        }
-    }
-
-    /// Build CMGR response lines for a PDU
-    fn cmgr_lines(pdu: &str) -> Vec<String> {
-        vec![
-            format!("AT+CMGR=1"),
-            format!("\"+CMGR: 0,\\\"\\\",{}\"", pdu.len() / 2),
-            pdu.to_string(),
-            "OK".to_string(),
-        ]
-    }
-
-    #[test]
-    fn test_init_command_order() {
-        let port = MockRawPort::new();
-        let clock = MockClock::new(Instant::now());
-        let mut service = SmsService::with_clock_and_storage(port, clock, SmsStorage::SM);
-
-        service.init().unwrap();
-
-        let commands = service.port.get_written_commands();
-        // Verify exact command order
-        assert_eq!(commands[0], "AT"); // AT sync
-        assert_eq!(commands[1], "ATE0"); // Echo off
-        assert_eq!(commands[2], "AT+CPIN?"); // PIN status
-                                             // CREG/CEREG checks may appear multiple times during wait
-                                             // Find CMGF=0
-        let cmgf_idx = commands
-            .iter()
-            .position(|c| c == "AT+CMGF=0")
-            .expect("CMGF=0 not found");
-        // CPMS should be after CMGF
-        let cpms_idx = commands
-            .iter()
-            .position(|c| c.starts_with("AT+CPMS="))
-            .expect("CPMS not found");
-        assert!(cpms_idx > cmgf_idx, "CPMS should come after CMGF=0");
-        // CNMI should be after CPMS
-        let cnmi_idx = commands
-            .iter()
-            .position(|c| c == "AT+CNMI=2,1,0,0,0")
-            .expect("CNMI not found");
-        assert!(cnmi_idx > cpms_idx, "CNMI should come after CPMS");
-
-        // Verify CPMS uses SM storage
-        let cpms_cmd = &commands[cpms_idx];
-        assert!(
-            cpms_cmd.contains("\"SM\""),
-            "CPMS should use SM storage: {}",
-            cpms_cmd
-        );
-        assert!(
-            !commands.iter().any(|c| c == "AT+CSCS=\"UCS2\""),
-            "CSCS=UCS2 should not be sent"
-        );
-    }
-
-    #[test]
-    fn test_init_storage_me() {
-        let port = MockRawPort::new();
-        let clock = MockClock::new(Instant::now());
-        let mut service = SmsService::with_clock_and_storage(port, clock, SmsStorage::ME);
-
-        service.init().unwrap();
-
-        let commands = service.port.get_written_commands();
-        let cpms_idx = commands
-            .iter()
-            .position(|c| c.starts_with("AT+CPMS="))
-            .expect("CPMS not found");
-        let cpms_cmd = &commands[cpms_idx];
-        assert!(
-            cpms_cmd.contains("\"ME\""),
-            "CPMS should use ME storage: {}",
-            cpms_cmd
-        );
-    }
-
-    #[test]
-    fn test_init_cpin_not_ready() {
-        let port = MockRawPort::new();
-        port.set_cpin_not_ready(true);
-        let clock = MockClock::new(Instant::now());
-        let mut service = SmsService::with_clock_and_storage(port, clock, SmsStorage::SM);
-
-        let result = service.init();
-        assert!(result.is_err(), "init should fail when CPIN not ready");
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("SIM not ready"),
-            "Error should mention SIM not ready: {}",
-            err
-        );
-    }
-
-    #[test]
-    fn test_init_cmgf_error() {
-        let port = MockRawPort::new();
-        port.set_cmgf_error(true);
-        let clock = MockClock::new(Instant::now());
-        let mut service = SmsService::with_clock_and_storage(port, clock, SmsStorage::SM);
-
-        let result = service.init();
-        assert!(result.is_err(), "init should fail when CMGF returns ERROR");
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("PDU mode"),
-            "Error should mention PDU mode: {}",
-            err
-        );
-    }
-
-    #[test]
-    fn test_at_sync_retries() {
-        let port = MockRawPort::new();
-        // Fail first 3 AT attempts, then succeed
-        port.set_at_sync_failures(3);
-        let clock = MockClock::new(Instant::now());
-        let mut service = SmsService::with_clock_and_storage(port, clock, SmsStorage::SM);
-
-        service.init().unwrap();
-
-        let commands = service.port.get_written_commands();
-        // Should have 4 AT commands (3 failures + 1 success)
-        let at_count = commands.iter().filter(|c| *c == "AT").count();
-        assert_eq!(
-            at_count, 4,
-            "AT sync should be attempted 4 times (3 retries + success)"
-        );
-    }
-
-    #[test]
-    fn test_multipart_three_parts_completes_and_deletes() {
-        // Use GSM7_10_P1, P2, P3 at indices 4, 5, 6
-        let p1_pdu = GSM7_10_P1.0;
-        let p2_pdu = GSM7_10_P2.0;
-        let p3_pdu = GSM7_10_P3.0;
-
-        let port = MockRawPort::new();
-        // Queue CMTI notifications as raw bytes - but we need to interleave them with CMGR responses
-        // The issue is that send_command reads from the queue, so we need to queue CMGR responses
-        // at the right time. Let's use the write_raw hook to queue CMGR responses.
-        port.add_cmgr_response(4, cmgr_lines(p1_pdu));
-        port.add_cmgr_response(5, cmgr_lines(p2_pdu));
-        port.add_cmgr_response(6, cmgr_lines(p3_pdu));
-        // Pre-queue CMTI notifications - they will be read by poll_urcs
-        port.push_read(b"\r\n+CMTI: \"SM\",4\r\n".to_vec());
-        port.push_read(b"\r\n+CMTI: \"SM\",5\r\n".to_vec());
-        port.push_read(b"\r\n+CMTI: \"SM\",6\r\n".to_vec());
-
-        let clock = MockClock::new(Instant::now());
-        let mut service = SmsService::with_clock_and_storage(port, clock, SmsStorage::SM);
-
-        let received = Arc::new(Mutex::new(Vec::new()));
-        let received_clone = received.clone();
-        service.on_sms(move |sms| {
-            received_clone.lock().unwrap().push(sms.message);
-        });
-
-        service.init().unwrap();
-
-        // Poll for all three parts
-        service.poll(Duration::from_millis(100)).unwrap();
-        service.poll(Duration::from_millis(100)).unwrap();
-        service.poll(Duration::from_millis(100)).unwrap();
-
-        // Check callback was called once with joined message
-        let msgs = received.lock().unwrap();
-        assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0], "one two three");
-
-        // Check all three indices were deleted
-        let deleted = service.port.get_deleted();
-        assert_eq!(deleted.len(), 3);
-        let mut deleted_sorted = deleted.clone();
-        deleted_sorted.sort();
-        assert_eq!(deleted_sorted, vec![4, 5, 6]);
-    }
-
-    #[test]
-    fn test_multipart_single_part_expires() {
-        // Only P1 arrives at index 4
-        let p1_pdu = GSM7_10_P1.0;
-
-        let port = MockRawPort::new();
-        port.add_cmgr_response(4, cmgr_lines(p1_pdu));
-        port.push_read(b"\r\n+CMTI: \"SM\",4\r\n".to_vec());
-
-        let start = Instant::now();
-        let clock = MockClock::new(start);
-        let mut service = SmsService::with_clock_and_storage(port, clock.clone(), SmsStorage::SM);
-
-        let received = Arc::new(Mutex::new(Vec::new()));
-        let received_clone = received.clone();
-        service.on_sms(move |sms| {
-            received_clone.lock().unwrap().push(sms.message);
-        });
-
-        service.init().unwrap();
-
-        // Poll for the first part
-        service.poll(Duration::from_millis(100)).unwrap();
-
-        // No callback yet (group incomplete)
-        assert!(received.lock().unwrap().is_empty());
-
-        // Advance time beyond timeout (5 minutes + 1 second)
-        clock.advance(Duration::from_secs(5 * 60 + 1));
-
-        // Poll again - should expire and deliver partial message
-        service.poll(Duration::from_millis(100)).unwrap();
-
-        // Check callback was called with partial message
-        let msgs = received.lock().unwrap();
-        assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0], "one ");
-
-        // Check index 4 was deleted
-        let deleted = service.port.get_deleted();
-        assert_eq!(deleted, vec![4]);
-    }
-
-    #[test]
-    fn test_non_multipart_delivers_and_deletes() {
-        // Plain GSM7_HI message
-        let pdu = GSM7_HI.0;
-
-        let port = MockRawPort::new();
-        port.add_cmgr_response(7, cmgr_lines(pdu));
-        port.push_read(b"\r\n+CMTI: \"SM\",7\r\n".to_vec());
-
-        let clock = MockClock::new(Instant::now());
-        let mut service = SmsService::with_clock_and_storage(port, clock, SmsStorage::SM);
-
-        let received = Arc::new(Mutex::new(Vec::new()));
-        let received_clone = received.clone();
-        service.on_sms(move |sms| {
-            received_clone.lock().unwrap().push(sms.message);
-        });
-
-        service.init().unwrap();
-
-        // Poll for the message
-        service.poll(Duration::from_millis(100)).unwrap();
-
-        // Check callback was called with message
-        let msgs = received.lock().unwrap();
-        assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0], "Hi");
-
-        // Check index 7 was deleted
-        let deleted = service.port.get_deleted();
-        assert_eq!(deleted, vec![7]);
-    }
-}
+mod tests;
