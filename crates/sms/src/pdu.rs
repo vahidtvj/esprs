@@ -115,7 +115,7 @@ pub fn parse_pdu_with_udh(pdu_hex: &str) -> Result<ParseResult> {
             anyhow::bail!("UCS2 UDL must be even");
         }
         let message = if is_ucs2 {
-            decode_ucs2(user_data)
+            decode_ucs2(&user_data[..udl])
         } else if is_8bit {
             // 8-bit data: decode as lossy UTF-8, bounded by UDL bytes
             let data = &user_data[..udl.min(user_data.len())];
@@ -150,11 +150,16 @@ fn parse_udh(
         anyhow::bail!("UDH length exceeds user data");
     }
 
-    let udh = &user_data[1..1 + udhl];
+    let udh_bytes = udhl + 1;
+    if (is_ucs2 || is_8bit) && udl < udh_bytes {
+        anyhow::bail!("UDL is smaller than the user data header");
+    }
+
+    let udh = &user_data[1..udh_bytes];
     let concat = parse_concat_ie(udh)?;
 
     // Calculate message data after UDH
-    let message_data = &user_data[1 + udhl..];
+    let message_data = &user_data[udh_bytes..];
 
     let message = if is_ucs2 {
         // UCS2: UDL is bytes, subtract UDHL+1 bytes
@@ -176,11 +181,13 @@ fn parse_udh(
     } else {
         // GSM-7: UDL is septets
         // padding bits = (7 - (8*(UDHL+1)) % 7) % 7
-        let udh_bytes = udhl + 1; // UDHL + 1 byte for UDHL itself
         let udh_bits = udh_bytes * 8;
         let padding_bits = (7 - (udh_bits % 7)) % 7;
         let udh_septets = (udh_bits + 6) / 7; // ceil(udh_bits / 7)
-        let msg_septets = udl.saturating_sub(udh_septets);
+        if udl < udh_septets {
+            anyhow::bail!("UDL is smaller than the user data header");
+        }
+        let msg_septets = udl - udh_septets;
         decode_gsm7(message_data, padding_bits as u8, msg_septets)
     };
 

@@ -1,9 +1,9 @@
-#[cfg(test)]
-pub mod ok_cases;
+pub mod concat_cases;
 pub mod err_hex_mti;
 pub mod err_length;
 pub mod err_udh;
-pub mod concat_cases;
+#[cfg(test)]
+pub mod ok_cases;
 
 /// Smoke test to verify the module compiles
 #[test]

@@ -1,9 +1,9 @@
 use anyhow::Result;
-use esp_idf_svc::hal::delay::TickType;
+use esp_idf_svc::hal::delay::{FreeRtos, TickType};
 use esp_idf_svc::hal::peripherals::Peripherals;
 use esp_idf_svc::hal::uart::*;
 use power::{PowerControl, SimcomPower};
-use sms::{send_command, AtError, AtPortRaw, AtState, SmsService, SystemClock};
+use sms::{AtPortRaw, SmsService};
 use std::time::Duration;
 
 mod pinout;
@@ -22,7 +22,14 @@ impl<'d> UartAtPort<'d> {
 impl<'d> AtPortRaw for UartAtPort<'d> {
     fn write_raw(&mut self, data: &[u8]) -> Result<()> {
         log::debug!(target: "uart", ">> {}", String::from_utf8_lossy(data).trim());
-        self.driver.write(data)?;
+        let mut written = 0;
+        while written < data.len() {
+            let count = self.driver.write(&data[written..])?;
+            if count == 0 {
+                anyhow::bail!("UART write returned zero bytes");
+            }
+            written += count;
+        }
         Ok(())
     }
 
@@ -41,7 +48,7 @@ impl<'d> AtPortRaw for UartAtPort<'d> {
     }
 }
 
-fn main() -> Result<()> {
+fn main() {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
     log::set_max_level(log::LevelFilter::Debug);
@@ -66,6 +73,14 @@ fn main() -> Result<()> {
         );
     }
 
+    if let Err(error) = run() {
+        log::error!("Fatal error: {:#}; restarting in 1 second", error);
+        FreeRtos::delay_ms(1000);
+        unsafe { esp_idf_svc::sys::esp_restart() };
+    }
+}
+
+fn run() -> Result<()> {
     log::info!("Starting ESP32 + SIMCOM A7670 modem workspace demo");
 
     let peripherals = Peripherals::take()?;
@@ -86,23 +101,12 @@ fn main() -> Result<()> {
         &config,
     )?;
 
-    let mut at_port = UartAtPort::new(uart);
-    let mut at_state = AtState::new();
-    let clock = SystemClock;
-    match send_command(
-        &mut at_port,
-        &clock,
-        "AT",
-        Duration::from_secs(2),
-        &mut at_state,
-    ) {
-        Ok(_) => log::info!("Modem is already powered and responded to AT"),
-        Err(error) if matches!(error.downcast_ref::<AtError>(), Some(AtError::Timeout)) => {
-            log::info!("Modem did not respond to AT; powering it on");
-            pwr.power_on()?;
-        }
-        Err(error) => return Err(error.context("failed to query modem with AT")),
-    }
+    let at_port = UartAtPort::new(uart);
+
+    log::info!("Power-cycling modem for a clean boot");
+    pwr.power_off()?;
+    FreeRtos::delay_ms(1000);
+    pwr.power_on()?;
 
     let mut sms_service = SmsService::new(at_port);
 

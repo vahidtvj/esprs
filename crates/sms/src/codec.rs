@@ -61,7 +61,7 @@ pub fn decode_gsm7(bytes: &[u8], padding_bits: u8, septet_count: usize) -> Strin
 
 fn parse_escape(c: u8) -> &'static str {
     match c {
-        0x0A => "",
+        0x0A => "\u{000C}",
         0x14 => "^",
         0x28 => "{",
         0x29 => "}",
@@ -87,4 +87,14 @@ fn gsm7_lookup(c: u8) -> &'static str {
         "ü", "à",
     ];
     GSM7_TABLE.get(c as usize).copied().unwrap_or("")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decodes_form_feed_extension() {
+        assert_eq!(decode_gsm7(&[0x1B, 0x05], 0, 2), "\u{000C}");
+    }
 }

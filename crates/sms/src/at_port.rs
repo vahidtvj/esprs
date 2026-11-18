@@ -52,6 +52,8 @@ pub struct AtState {
     cmd_lines: Vec<String>,
     /// Whether the command echo line has been seen
     saw_echo: bool,
+    /// Whether any non-empty modem response line has been received
+    saw_modem_activity: bool,
 }
 
 impl AtState {
@@ -62,6 +64,7 @@ impl AtState {
             in_command: false,
             cmd_lines: Vec::new(),
             saw_echo: false,
+            saw_modem_activity: false,
         }
     }
 
@@ -83,6 +86,7 @@ impl AtState {
                 if line.is_empty() {
                     continue;
                 }
+                self.saw_modem_activity = true;
 
                 // Check for URC: +CMTI: "<mem>",<index>
                 if line.starts_with("+CMTI:") {
@@ -165,6 +169,10 @@ impl AtState {
     /// Check if currently in a command
     pub fn in_command(&self) -> bool {
         self.in_command
+    }
+
+    pub fn saw_modem_activity(&self) -> bool {
+        self.saw_modem_activity
     }
 
     /// Get queued URC indices
@@ -326,8 +334,8 @@ impl Clock for MockClock {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
-    use std::time::{Duration, Instant};
+    use std::sync::Mutex;
+    use std::time::Duration;
 
     /// Mock raw port for testing
     struct MockRawPort {
@@ -343,14 +351,6 @@ mod tests {
                 read_queue: Mutex::new(Vec::new()),
                 written: Mutex::new(Vec::new()),
             }
-        }
-
-        fn push_read(&self, data: Vec<u8>) {
-            self.read_queue.lock().unwrap().push(data);
-        }
-
-        fn get_written(&self) -> Vec<u8> {
-            self.written.lock().unwrap().clone()
         }
     }
 
@@ -544,6 +544,14 @@ mod tests {
         let (_, urcs) = state.process_bytes(b"7\r\n");
         assert!(urcs.is_empty());
         assert_eq!(state.take_urcs(), vec![7]);
+    }
+
+    #[test]
+    fn test_boot_urc_counts_as_modem_activity() {
+        let mut state = AtState::new();
+        assert!(!state.saw_modem_activity());
+        state.process_bytes(b"\r\n*ATREADY: 1\r\n");
+        assert!(state.saw_modem_activity());
     }
 
     #[test]

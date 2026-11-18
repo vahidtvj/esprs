@@ -1,9 +1,11 @@
 use anyhow::{Context, Result};
 use std::time::{Duration, Instant};
 
-use crate::at_port::{poll_urcs, send_command, AtPortRaw, AtState, Clock, SystemClock};
+use crate::at_port::{poll_urcs, send_command, AtError, AtPortRaw, AtState, Clock, SystemClock};
 use crate::reassembler::{CompletedMessage, Reassembler, ReassemblerConfig};
 use crate::{ParseResult, Sms};
+
+const SMS_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Storage location for SMS messages
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,19 +124,8 @@ impl<P: AtPortRaw, C: Clock> SmsService<P, C> {
         )
         .context("failed to disable echo (ATE0)")?;
 
-        // 3. AT+CPIN? must report READY, else Err
-        let lines = send_command(
-            &mut self.port,
-            &self.clock,
-            "AT+CPIN?",
-            Duration::from_secs(5),
-            &mut self.at_state,
-        )
-        .context("failed to query SIM PIN status (AT+CPIN?)")?;
-
-        if !lines.iter().any(|line| line.contains("+CPIN: READY")) {
-            anyhow::bail!("SIM not ready: {}", lines.join(", "));
-        }
+        // 3. AT+CPIN? must report READY. AT can respond before SIM initialization completes.
+        self.wait_for_sim_ready()?;
 
         // 4. Network registration via AT+CREG?/AT+CEREG?, bounded wait; log and continue on timeout
         self.wait_for_network_registration()?;
@@ -144,7 +135,7 @@ impl<P: AtPortRaw, C: Clock> SmsService<P, C> {
             &mut self.port,
             &self.clock,
             "AT+CMGF=0",
-            Duration::from_secs(3),
+            SMS_COMMAND_TIMEOUT,
             &mut self.at_state,
         )
         .context("failed to set PDU mode (AT+CMGF=0)")?;
@@ -159,7 +150,7 @@ impl<P: AtPortRaw, C: Clock> SmsService<P, C> {
             &mut self.port,
             &self.clock,
             &cpms_cmd,
-            Duration::from_secs(5),
+            SMS_COMMAND_TIMEOUT,
             &mut self.at_state,
         )
         .context(format!(
@@ -172,7 +163,7 @@ impl<P: AtPortRaw, C: Clock> SmsService<P, C> {
             &mut self.port,
             &self.clock,
             "AT+CNMI=2,1,0,0,0",
-            Duration::from_secs(3),
+            SMS_COMMAND_TIMEOUT,
             &mut self.at_state,
         )
         .context("failed to configure new SMS indications (AT+CNMI)")?;
@@ -209,6 +200,52 @@ impl<P: AtPortRaw, C: Clock> SmsService<P, C> {
             }
         }
         anyhow::bail!("modem did not respond to AT after {} attempts", MAX_RETRIES);
+    }
+
+    fn wait_for_sim_ready(&mut self) -> Result<()> {
+        const MAX_RETRIES: usize = 30;
+        const RETRY_DELAY: Duration = Duration::from_millis(500);
+
+        for attempt in 1..=MAX_RETRIES {
+            match send_command(
+                &mut self.port,
+                &self.clock,
+                "AT+CPIN?",
+                SMS_COMMAND_TIMEOUT,
+                &mut self.at_state,
+            ) {
+                Ok(lines) => {
+                    if lines.iter().any(|line| line.contains("+CPIN: READY")) {
+                        return Ok(());
+                    }
+                    anyhow::bail!("SIM not ready: {}", lines.join(", "));
+                }
+                Err(error)
+                    if matches!(
+                        error.downcast_ref::<AtError>(),
+                        Some(AtError::CmeError(reason)) if ["SIM failure", "SIM busy"]
+                            .iter()
+                            .any(|state| reason.eq_ignore_ascii_case(state))
+                    ) =>
+                {
+                    log::debug!(
+                        "SIM not ready (attempt {}/{}): {}",
+                        attempt,
+                        MAX_RETRIES,
+                        error
+                    );
+                    if attempt == MAX_RETRIES {
+                        return Err(error).context("SIM initialization failed after retries");
+                    }
+                    self.clock.sleep(RETRY_DELAY);
+                }
+                Err(error) => {
+                    return Err(error).context("failed to query SIM PIN status (AT+CPIN?)");
+                }
+            }
+        }
+
+        unreachable!()
     }
 
     /// Wait for network registration (CREG and CEREG) with bounded wait
@@ -274,7 +311,7 @@ impl<P: AtPortRaw, C: Clock> SmsService<P, C> {
             &mut self.port,
             &self.clock,
             &format!("AT+CMGR={}", index),
-            Duration::from_secs(5),
+            SMS_COMMAND_TIMEOUT,
             &mut self.at_state,
         )
     }
@@ -289,7 +326,7 @@ impl<P: AtPortRaw, C: Clock> SmsService<P, C> {
             &mut self.port,
             &self.clock,
             &format!("AT+CMGD={}", index),
-            Duration::from_secs(3),
+            SMS_COMMAND_TIMEOUT,
             &mut self.at_state,
         )?;
         Ok(())
@@ -356,7 +393,6 @@ impl<P: AtPortRaw, C: Clock> SmsService<P, C> {
             Ok(lines) => lines,
             Err(error) => {
                 log::error!("Failed to read SMS at index {}: {}", index, error);
-                self.delete_logged(index);
                 return;
             }
         };
@@ -406,7 +442,7 @@ impl<P: AtPortRaw, C: Clock> SmsService<P, C> {
             &mut self.port,
             &self.clock,
             "AT+CMGL=4",
-            Duration::from_secs(5),
+            SMS_COMMAND_TIMEOUT,
             &mut self.at_state,
         ) {
             Ok(lines) => lines,

@@ -71,6 +71,10 @@ impl<'d> SimcomPower<'d> {
 
 impl<'d> PowerControl for SimcomPower<'d> {
     fn power_on(&mut self) -> Result<()> {
+        if self.is_on {
+            return Ok(());
+        }
+
         if let Some(ref mut en) = self.power_en {
             en.set_high()?;
             FreeRtos::delay_ms(MODEM_POWER_ON_DELAY_MS);

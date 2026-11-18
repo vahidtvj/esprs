@@ -22,6 +22,8 @@ struct MockRawPort {
     written_commands: Mutex<Vec<String>>,
     /// Whether to simulate CPIN not ready
     cpin_not_ready: Mutex<bool>,
+    /// Number of initial CPIN queries that return SIM failure
+    cpin_sim_failures: Mutex<usize>,
     /// Whether to simulate CMGF error
     cmgf_error: Mutex<bool>,
     /// AT sync failure count (for testing retries)
@@ -38,6 +40,7 @@ impl MockRawPort {
             deleted_indices: Mutex::new(Vec::new()),
             written_commands: Mutex::new(Vec::new()),
             cpin_not_ready: Mutex::new(false),
+            cpin_sim_failures: Mutex::new(0),
             cmgf_error: Mutex::new(false),
             at_sync_failures: Mutex::new(0),
         }
@@ -77,6 +80,10 @@ impl MockRawPort {
     /// Set CPIN not ready for testing
     fn set_cpin_not_ready(&self, val: bool) {
         *self.cpin_not_ready.lock().unwrap() = val;
+    }
+
+    fn set_cpin_sim_failures(&self, count: usize) {
+        *self.cpin_sim_failures.lock().unwrap() = count;
     }
 
     /// Set CMGF error for testing
@@ -142,7 +149,15 @@ impl AtPortRaw for MockRawPort {
         } else if cmd == "ATE0" {
             b"OK\r\n".to_vec()
         } else if cmd == "AT+CPIN?" {
-            if *self.cpin_not_ready.lock().unwrap() {
+            let mut failures = self.cpin_sim_failures.lock().unwrap();
+            if *failures > 0 {
+                *failures -= 1;
+                if *failures == 0 {
+                    b"+CME ERROR: SIM busy\r\n".to_vec()
+                } else {
+                    b"+CME ERROR: SIM failure\r\n".to_vec()
+                }
+            } else if *self.cpin_not_ready.lock().unwrap() {
                 b"\r\n+CPIN: SIM PIN\r\n\r\nOK\r\n".to_vec()
             } else {
                 b"\r\n+CPIN: READY\r\n\r\nOK\r\n".to_vec()
@@ -274,6 +289,24 @@ fn test_init_cpin_not_ready() {
         "Error should mention SIM not ready: {}",
         err
     );
+}
+
+#[test]
+fn test_init_retries_transient_sim_states() {
+    let port = MockRawPort::new();
+    port.set_cpin_sim_failures(2);
+    let clock = MockClock::new(Instant::now());
+    let mut service = SmsService::with_clock_and_storage(port, clock, SmsStorage::SM);
+
+    service.init().unwrap();
+
+    let cpin_count = service
+        .port
+        .get_written_commands()
+        .iter()
+        .filter(|command| *command == "AT+CPIN?")
+        .count();
+    assert_eq!(cpin_count, 3);
 }
 
 #[test]
@@ -546,6 +579,20 @@ fn test_cmgl_sweep_reassembles_multipart_message() {
 
     assert_eq!(*received.lock().unwrap(), vec!["one two three"]);
     assert_eq!(service.port.get_deleted(), vec![4, 5, 6]);
+}
+
+#[test]
+fn test_cmgr_read_failure_does_not_delete_message() {
+    let port = MockRawPort::new();
+    port.push_read(b"\r\n+CMTI: \"SM\",7\r\n".to_vec());
+    let clock = MockClock::new(Instant::now());
+    let (mut service, received) = service_with_callback(port, clock);
+
+    service.init().unwrap();
+    service.poll(Duration::from_millis(1)).unwrap();
+
+    assert!(received.lock().unwrap().is_empty());
+    assert!(service.port.get_deleted().is_empty());
 }
 
 #[test]

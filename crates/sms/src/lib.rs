@@ -326,6 +326,23 @@ mod tests {
     }
 
     #[test]
+    fn test_ucs2_decoding_is_bounded_by_udl() {
+        use crate::test_vectors::ok_cases::UCS2_SALAM;
+        let pdu = format!("{}0041", UCS2_SALAM.0);
+        let sms = parse_pdu(&pdu).unwrap();
+        assert_eq!(sms.message, UCS2_SALAM.2);
+    }
+
+    #[test]
+    fn test_udh_larger_than_udl_is_rejected() {
+        let ucs2 = "0791893905004100440C918929103254760008621101719185400505000307020106330644062706450020";
+        assert!(parse_pdu_with_udh(ucs2).is_err());
+
+        let gsm7 = "0791893905004100440C9189291032547600006211017191854006050003100301DEEE3208";
+        assert!(parse_pdu_with_udh(gsm7).is_err());
+    }
+
+    #[test]
     fn test_concat_16bit_ref() {
         // Test UCS2_1234_P1 and UCS2_1234_P2 which use 16-bit ref (IE 0x08)
         use crate::test_vectors::concat_cases::*;
