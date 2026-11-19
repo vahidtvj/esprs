@@ -1,0 +1,10 @@
+[package]
+name = "mqtt"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0"
+embedded-svc = "0.29"
+esp-idf-svc = "0.53"
+log = "0.4"

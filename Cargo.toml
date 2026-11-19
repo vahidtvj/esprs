@@ -7,7 +7,7 @@ resolver = "2"
 rust-version = "1.82"
 
 [workspace]
-members = [".", "crates/power", "crates/sms"]
+members = [".", "crates/mqtt", "crates/power", "crates/sms", "crates/wifi"]
 
 [[bin]]
 name = "esprs"
@@ -28,9 +28,11 @@ esp-idf-svc = { git = "https://github.com/esp-rs/esp-idf-svc.git" }
 log = "0.4"
 esp-idf-svc = "0.53"
 anyhow = "1.0.104"
+mqtt = { path = "crates/mqtt" }
 power = { path = "crates/power" }
 sms = { path = "crates/sms" }
-base64 = "0.23.1"
+wifi = { path = "crates/wifi" }
 
 [build-dependencies]
+dotenvy = "0.15.7"
 embuild = "0.33.5"
